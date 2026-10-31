@@ -36,7 +36,27 @@ Every changed line is marked `MailCraft:` in a comment, with a test beside it.
      is an error, where both overflowed `u16`.
 
    Tests: `ndb::block::tests`.
+2. **`PtypObject` reads** (`ltp/prop_type.rs`): `PropertyType::try_from` had no arm for `0x000D`,
+   though the enum and the record reader have it, so an attached message's 0x3701 didn't parse.
+   Test: `ltp::prop_type::tests`.
+3. **A BTH record that doesn't parse is skipped** (`ltp/tree.rs`): each leaf record is read from
+   its own fixed-size slot (key and value sizes from the BTH header), and one that fails is left
+   out with a warning. The scan used to stop there, so every property after it was lost (an
+   attachment kept 0x0E20 and 0x3001 and lost its method). A BTH that yields more than 2^24
+   records is an error. Test: `ltp::tree::tests`.
+4. **The object an attachment holds is looked up in its own subnode tree**
+   (`messaging/attachment.rs`, `AttachmentInner::object_node`), where MS-PST keeps it, then in the
+   message's, where this crate looked; for attached messages and OLE storage alike.
+5. **An attached message is read once the file's lock is let go** (`messaging/attachment.rs`):
+   `read_embedded` locks the file again, and `std::sync::Mutex` isn't re-entrant, so the first
+   attached message hung the reader for good.
+6. **A by-value attachment with no value reads as a zero-byte file** (`messaging/attachment.rs`):
+   such a file is kept as 0x3701 with HNID 0, which reads as `PtypNull`, and was an error.
+7. **`UnicodeAttachment::embedded_message()` and `AnsiAttachment::embedded_message()`** hand back
+   the attached message as the file's own message type (kept beside the `Rc<dyn Message>` in
+   `AttachmentData::Message`), so its own attachments read with `UnicodeAttachment::read`.
 
-Fix 1 is also proved on whole files in MailCraft's `crates/net/src/data_files/pst/tests/reader.rs`:
-files made with `outlook-pst-rw` and changed byte by byte into a data tree that says less than it
-holds and one that points at itself, each read on a thread with a time limit.
+Fixes 1 and 4 to 7 are also proved on whole files in MailCraft's
+`crates/net/src/data_files/pst/tests/reader.rs`: files made with `outlook-pst-rw` and changed
+byte by byte into an attachment that holds a message, a zero-byte file, a data tree that says
+less than it holds and one that points at itself, each read on a thread with a time limit.

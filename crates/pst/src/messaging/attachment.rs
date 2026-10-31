@@ -11,7 +11,7 @@ use crate::{
         read_write::*,
     },
     ndb::{
-        block::{DataTree, IntermediateTreeBlock},
+        block::{DataTree, IntermediateTreeBlock, LeafSubNodeTreeEntry, SubNodeTree},
         block_id::BlockId,
         header::Header,
         node_id::{NodeId, NodeIdType},
@@ -19,7 +19,7 @@ use crate::{
         read_write::*,
         root::Root,
     },
-    AnsiPstFile, PstFile, PstFileLock, UnicodePstFile,
+    AnsiPstFile, PstFile, PstFileLock, PstReader, UnicodePstFile,
 };
 
 #[derive(Default, Debug)]
@@ -144,6 +144,9 @@ where
     message: Rc<Pst::Message>,
     properties: AttachmentProperties,
     data: Option<AttachmentData>,
+    /// MailCraft: the attached message as the file's own type, so its attachments can be read
+    /// in turn (`data` holds the same message as `dyn Message`).
+    embedded: Option<Rc<Pst::Message>>,
 }
 
 impl<Pst> AttachmentInner<Pst>
@@ -177,6 +180,13 @@ where
     <<Pst as PstFile>::DataTreeBlock as IntermediateTreeBlock>::Entry:
         IntermediateTreeEntryReadWrite,
     <Pst as PstFile>::DataBlock: BlockReadWrite + Clone,
+    <Pst as PstFile>::SubNodeTreeBlockHeader: IntermediateTreeHeaderReadWrite,
+    <Pst as PstFile>::SubNodeTreeBlock: IntermediateTreeBlockReadWrite,
+    <<Pst as PstFile>::SubNodeTreeBlock as IntermediateTreeBlock>::Entry:
+        IntermediateTreeEntryReadWrite,
+    <Pst as PstFile>::SubNodeBlock: IntermediateTreeBlockReadWrite,
+    <<Pst as PstFile>::SubNodeBlock as IntermediateTreeBlock>::Entry:
+        IntermediateTreeEntryReadWrite,
     <Pst as PstFile>::HeapNode: HeapNodeReadWrite<Pst>,
     <Pst as PstFile>::PropertyTree: HeapTreeReadWrite<Pst>,
     <Pst as PstFile>::PropertyContext: PropertyContextReadWrite<Pst>,
@@ -202,7 +212,7 @@ where
         let root = header.root();
         let limit = pst.max_value_size();
 
-        let (properties, data) = {
+        let (properties, data, embedded_node) = {
             let mut file = pst
                 .reader()
                 .lock()
@@ -225,6 +235,9 @@ where
                 node.sub_node(),
                 None,
             );
+            // MailCraft: the attachment's own subnode tree, where MS-PST keeps the object it
+            // holds (an attached message, or OLE storage).
+            let own_sub_nodes = node.sub_node();
 
             let mut page_cache = pst.block_cache();
             let data = node.data();
@@ -261,13 +274,16 @@ where
             let properties = AttachmentProperties { properties };
 
             let attachment_method = AttachmentMethod::try_from(properties.attachment_method()?)?;
+            let mut embedded_node = None;
             let data = match attachment_method {
                 AttachmentMethod::ByValue => {
                     let binary_data = match properties
                         .get(0x3701)
                         .ok_or(MessagingError::AttachmentMessageObjectDataNotFound)?
                     {
-                        PropertyValue::Binary(value) => value,
+                        PropertyValue::Binary(value) => value.clone(),
+                        // MailCraft: a zero-byte file is kept with no value at all (HNID 0).
+                        PropertyValue::Null => BinaryValue::new(Vec::new()),
                         invalid => {
                             return Err(MessagingError::InvalidMessageObjectData(
                                 PropertyType::from(invalid),
@@ -275,7 +291,7 @@ where
                             .into())
                         }
                     };
-                    Some(AttachmentData::Binary(binary_data.clone()))
+                    Some(AttachmentData::Binary(binary_data))
                 }
                 AttachmentMethod::EmbeddedMessage => {
                     let object_data = match properties
@@ -291,24 +307,16 @@ where
                         }
                     };
 
-                    let sub_node = object_data.node();
-                    let node = message
-                        .sub_nodes()
-                        .get(&sub_node)
-                        .ok_or(MessagingError::AttachmentSubNodeNotFound(sub_node))?;
-                    let node = <<Pst as PstFile>::NodeBTreeEntry as NodeBTreeEntryReadWrite>::new(
-                        node.node(),
-                        node.block(),
-                        node.sub_node(),
-                        None,
-                    );
-                    let message =
-                        <<Pst as PstFile>::Message as MessageReadWrite<Pst>>::read_embedded(
-                            store.clone(),
-                            node,
-                            prop_ids,
-                        )?;
-                    Some(AttachmentData::Message(message))
+                    // MailCraft: the message is read below, once the file's lock is let go.
+                    embedded_node = Some(Self::object_node(
+                        file,
+                        &block_btree,
+                        &mut page_cache,
+                        own_sub_nodes,
+                        &message,
+                        object_data.node(),
+                    )?);
+                    None
                 }
                 AttachmentMethod::Storage => {
                     let object_data = match properties
@@ -323,13 +331,16 @@ where
                             .into())
                         }
                     };
-                    let sub_node = object_data.node();
-                    let node = message
-                        .sub_nodes()
-                        .get(&sub_node)
-                        .ok_or(MessagingError::AttachmentSubNodeNotFound(sub_node))?;
+                    let node = Self::object_node(
+                        file,
+                        &block_btree,
+                        &mut page_cache,
+                        own_sub_nodes,
+                        &message,
+                        object_data.node(),
+                    )?;
                     let block =
-                        block_btree.find_entry(file, node.block().search_key(), &mut page_cache)?;
+                        block_btree.find_entry(file, node.data().search_key(), &mut page_cache)?;
                     let block = DataTree::read(file, encoding, &block)?;
                     // MailCraft: no more than the tree declares, nor than the file's limit.
                     let data = block.read_capped(
@@ -345,14 +356,67 @@ where
                 _ => None,
             };
 
-            (properties, data)
+            (properties, data, embedded_node)
+        };
+
+        // MailCraft: reading the attached message locks the file again, and `std::sync::Mutex`
+        // isn't re-entrant: read inside the block above, the first attached message hung.
+        let (data, embedded) = match embedded_node {
+            Some(node) => {
+                let embedded = <<Pst as PstFile>::Message as MessageReadWrite<Pst>>::read_embedded(
+                    store.clone(),
+                    node,
+                    prop_ids,
+                )?;
+                let data: Rc<dyn Message> = embedded.clone();
+                (Some(AttachmentData::Message(data)), Some(embedded))
+            }
+            None => (data, None),
         };
 
         Ok(Self {
             message,
             properties,
             data,
+            embedded,
         })
+    }
+
+    /// MailCraft: the node of the object an attachment holds, looked up in the attachment's own
+    /// subnode tree (MS-PST 2.4.6.2), then in the message's, where this crate looked before.
+    fn object_node<R: PstReader>(
+        file: &mut R,
+        block_btree: &crate::PstFileReadWriteBlockBTree<Pst>,
+        page_cache: &mut RootBTreePageCache<<Pst as PstFile>::BlockBTree>,
+        own_sub_nodes: Option<<Pst as PstFile>::BlockId>,
+        message: &<Pst as PstFile>::Message,
+        object: NodeId,
+    ) -> io::Result<<Pst as PstFile>::NodeBTreeEntry> {
+        let own = match own_sub_nodes {
+            Some(sub_nodes) => {
+                let block = block_btree.find_entry(file, sub_nodes.search_key(), page_cache)?;
+                SubNodeTree::<Pst>::read(file, &block)?
+                    .entries(file, block_btree, page_cache)?
+                    .find(|entry| u32::from(entry.node()) == u32::from(object))
+            }
+            None => None,
+        };
+        let entry = match own {
+            Some(entry) => entry,
+            None => message
+                .sub_nodes()
+                .get(&object)
+                .map(|entry| LeafSubNodeTreeEntry::new(entry.node(), entry.block(), entry.sub_node()))
+                .ok_or(MessagingError::AttachmentSubNodeNotFound(object))?,
+        };
+        Ok(
+            <<Pst as PstFile>::NodeBTreeEntry as NodeBTreeEntryReadWrite>::new(
+                entry.node(),
+                entry.block(),
+                entry.sub_node(),
+                None,
+            ),
+        )
     }
 }
 
@@ -367,6 +431,11 @@ impl UnicodeAttachment {
         prop_ids: Option<&[u16]>,
     ) -> io::Result<Rc<Self>> {
         <Self as AttachmentReadWrite<UnicodePstFile>>::read(message, sub_node, prop_ids)
+    }
+    /// MailCraft: the attached message this attachment holds, as a [`UnicodeMessage`], whose own
+    /// attachments read with [`UnicodeAttachment::read`]. `None` for any other attachment.
+    pub fn embedded_message(&self) -> Option<Rc<UnicodeMessage>> {
+        self.inner.embedded.clone()
     }
 }
 
@@ -406,6 +475,11 @@ impl AnsiAttachment {
         prop_ids: Option<&[u16]>,
     ) -> io::Result<Rc<Self>> {
         <Self as AttachmentReadWrite<AnsiPstFile>>::read(message, sub_node, prop_ids)
+    }
+    /// MailCraft: the attached message this attachment holds, as a [`AnsiMessage`], whose own
+    /// attachments read with [`AnsiAttachment::read`]. `None` for any other attachment.
+    pub fn embedded_message(&self) -> Option<Rc<AnsiMessage>> {
+        self.inner.embedded.clone()
     }
 }
 

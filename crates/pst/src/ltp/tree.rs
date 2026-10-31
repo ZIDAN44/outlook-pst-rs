@@ -246,6 +246,11 @@ where
             for heap_id in mem::take(&mut next_level).into_iter() {
                 let mut cursor = Cursor::new(self.heap.find_entry(heap_id)?);
                 while let Ok(row) = HeapTreeIntermediateEntry::<K>::read(&mut cursor) {
+                    // MailCraft: index records that point back up the tree multiply at every
+                    // level; a real tree never comes near this.
+                    if next_level.len() >= MAX_HEAP_TREE_RECORDS {
+                        return Err(LtpError::HeapTreeTooLarge(MAX_HEAP_TREE_RECORDS).into());
+                    }
                     next_level.push(row.next_level());
                 }
             }
@@ -255,14 +260,44 @@ where
 
         let mut results = Vec::new();
         for heap_id in mem::take(&mut next_level).into_iter() {
-            let mut cursor = Cursor::new(self.heap.find_entry(heap_id)?);
-            while let Ok(row) = HeapTreeLeafEntry::<K, V>::read(&mut cursor) {
-                results.push(row);
+            let records = leaf_records::<K, V>(self.heap.find_entry(heap_id)?);
+            if results.len().saturating_add(records.len()) > MAX_HEAP_TREE_RECORDS {
+                return Err(LtpError::HeapTreeTooLarge(MAX_HEAP_TREE_RECORDS).into());
             }
+            results.extend(records);
         }
 
         Ok(results)
     }
+}
+
+/// MailCraft: the most records read from one BTH, at any level.
+const MAX_HEAP_TREE_RECORDS: usize = 1 << 24;
+
+/// MailCraft: the records of one leaf, each read from its own fixed-size slot. A record that
+/// doesn't parse (a property type this crate doesn't know) is skipped: it used to end the scan,
+/// so every record after it was lost.
+fn leaf_records<K, V>(data: &[u8]) -> Vec<HeapTreeLeafEntry<K, V>>
+where
+    K: HeapTreeEntryKey + HeapNodePageReadWrite,
+    V: HeapTreeEntryValue + HeapNodePageReadWrite,
+{
+    let size = usize::from(K::SIZE) + usize::from(V::SIZE);
+    data.chunks_exact(size.max(1))
+        .filter_map(|record| {
+            match HeapTreeLeafEntry::<K, V>::read(&mut Cursor::new(record)) {
+                Ok(row) => Some(row),
+                Err(err) => {
+                    tracing::warn!(
+                        name: "PstSkippedHeapTreeRecord",
+                        ?err,
+                        "A BTH record that could not be read was skipped"
+                    );
+                    None
+                }
+            }
+        })
+        .collect()
 }
 
 pub struct UnicodeHeapTree<K, V>
@@ -370,5 +405,38 @@ where
 {
     fn from(value: AnsiHeapTree<K, V>) -> Self {
         value.inner.heap
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ltp::prop_context::{
+        PropertyTreeRecordKey, PropertyTreeRecordValue, PropertyValueRecord,
+    };
+    use crate::ltp::prop_type::PropertyType;
+
+    fn record(key: u16, prop_type: u16, value: u32) -> Vec<u8> {
+        [&key.to_le_bytes()[..], &prop_type.to_le_bytes(), &value.to_le_bytes()].concat()
+    }
+
+    /// MailCraft: an attachment's properties, sorted by id as they are kept, read past a record
+    /// of a type no one knows and past `PtypObject`, which used to end the scan after 0x3001.
+    #[test]
+    fn a_record_that_does_not_parse_is_skipped() {
+        let data = [
+            record(0x0E20, 0x0003, 5),
+            record(0x3001, 0x0099, 0),
+            record(0x3701, 0x000D, 0x20),
+            record(0x3705, 0x0003, 5),
+            vec![0x0B, 0x37, 0x03], // a partial record at the end
+        ]
+        .concat();
+        let rows = leaf_records::<PropertyTreeRecordKey, PropertyTreeRecordValue>(&data);
+        let keys: Vec<u16> = rows.iter().map(|r| r.key()).collect();
+        assert_eq!(keys, [0x0E20, 0x3701, 0x3705]);
+        let object = rows[1].data();
+        assert_eq!(object.prop_type(), PropertyType::Object);
+        assert!(matches!(object.value(), PropertyValueRecord::Heap(h) if u32::from(h) == 0x20));
     }
 }

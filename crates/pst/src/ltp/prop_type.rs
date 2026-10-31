@@ -108,6 +108,9 @@ impl TryFrom<u16> for PropertyType {
             0x0040 => Ok(Self::Time),
             0x0048 => Ok(Self::Guid),
             0x0102 => Ok(Self::Binary),
+            // MailCraft: `PtypObject` was missing here, so the attachment property that holds an
+            // attached message (0x3701) failed to parse.
+            0x000D => Ok(Self::Object),
 
             0x1002 => Ok(Self::MultipleInteger16),
             0x1003 => Ok(Self::MultipleInteger32),
@@ -130,5 +133,25 @@ impl TryFrom<u16> for PropertyType {
 impl From<PropertyType> for u16 {
     fn from(value: PropertyType) -> Self {
         value as u16
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// MailCraft: every type the enum names reads back from its number, `PtypObject` included.
+    #[test]
+    fn every_type_reads_back() {
+        for t in [
+            PropertyType::Null,
+            PropertyType::Integer32,
+            PropertyType::Binary,
+            PropertyType::Object,
+            PropertyType::MultipleBinary,
+        ] {
+            assert_eq!(PropertyType::try_from(u16::from(t)).ok(), Some(t));
+        }
+        assert!(PropertyType::try_from(0x0099).is_err());
     }
 }

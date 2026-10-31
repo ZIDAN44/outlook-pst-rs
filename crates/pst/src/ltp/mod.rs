@@ -95,6 +95,8 @@ pub enum LtpError {
     InvalidTableColumnBooleanValue(u8),
     #[error("Missing TCROWID: 0x{0:08X}")]
     TableRowIdNotFound(u32),
+    #[error("BTH has more than {0} records")]
+    HeapTreeTooLarge(usize),
 }
 
 impl From<LtpError> for io::Error {
