@@ -23,3 +23,20 @@ pins its revisions. Drop the fork once a release has all of the fixes.
 ## Fixes
 
 Every changed line is marked `MailCraft:` in a comment, with a test beside it.
+
+1. **Reads are capped** (`ndb/block.rs`, `ndb/read_write.rs`, `ltp/prop_context.rs`, `lib.rs`):
+   - a data tree is read up to the size its XBLOCK declares (`DataTree::read_capped`), so blocks
+     named twice can't make a value bigger than that;
+   - `UnicodePstFile::set_max_value_size` (and the Ansi twin) sets a limit for a message's and an
+     attachment's values (`PropertyContextReadWrite::read_property_capped`): a value declared
+     bigger is an error before any of it is read;
+   - a data tree is level 1 or 2 and a subnode tree level 0 or 1, and each block points one
+     level down, so a tree that points back at itself is an error, not a stack overflow;
+   - an intermediate block's entry count is checked in `u32`, and a block smaller than its header
+     is an error, where both overflowed `u16`.
+
+   Tests: `ndb::block::tests`.
+
+Fix 1 is also proved on whole files in MailCraft's `crates/net/src/data_files/pst/tests/reader.rs`:
+files made with `outlook-pst-rw` and changed byte by byte into a data tree that says less than it
+holds and one that points at itself, each read on a thread with a time limit.

@@ -200,6 +200,7 @@ where
         let pst = store.pst();
         let header = pst.header();
         let root = header.root();
+        let limit = pst.max_value_size();
 
         let (properties, data) = {
             let mut file = pst
@@ -244,8 +245,16 @@ where
                 .properties()?
                 .into_iter()
                 .map(|(prop_id, record)| {
+                    // MailCraft: under the file's limit.
                     prop_context
-                        .read_property(file, encoding, &block_btree, &mut page_cache, record)
+                        .read_property_capped(
+                            file,
+                            encoding,
+                            &block_btree,
+                            &mut page_cache,
+                            record,
+                            limit,
+                        )
                         .map(|value| (prop_id, value))
                 })
                 .collect::<io::Result<BTreeMap<_, _>>>()?;
@@ -322,16 +331,15 @@ where
                     let block =
                         block_btree.find_entry(file, node.block().search_key(), &mut page_cache)?;
                     let block = DataTree::read(file, encoding, &block)?;
-                    let mut data = vec![];
-                    let _ = block
-                        .reader(
-                            file,
-                            encoding,
-                            &block_btree,
-                            &mut page_cache,
-                            &mut Default::default(),
-                        )?
-                        .read_to_end(&mut data)?;
+                    // MailCraft: no more than the tree declares, nor than the file's limit.
+                    let data = block.read_capped(
+                        file,
+                        encoding,
+                        &block_btree,
+                        &mut page_cache,
+                        &mut Default::default(),
+                        limit,
+                    )?;
                     Some(AttachmentData::Binary(BinaryValue::new(data)))
                 }
                 _ => None,

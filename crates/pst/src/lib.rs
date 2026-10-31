@@ -10,7 +10,10 @@ use std::{
     mem,
     path::Path,
     rc::Rc,
-    sync::Mutex,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Mutex,
+    },
 };
 use thiserror::Error;
 use tracing::{error, instrument, warn};
@@ -209,6 +212,10 @@ pub trait PstFile: Sized {
 
     fn read_node(&self, node: NodeId) -> io::Result<Self::NodeBTreeEntry>;
     fn read_block(&self, block: Self::BlockId) -> io::Result<Vec<u8>>;
+
+    /// MailCraft: the most bytes a message's or an attachment's value may hold in this file
+    /// (no limit unless one was set, beyond the size each value declares).
+    fn max_value_size(&self) -> u64;
 }
 
 struct PstFileInner<Pst>
@@ -221,6 +228,7 @@ where
     density_list: io::Result<Pst::DensityListPage>,
     node_cache: NodeBTreePageCache<Pst>,
     block_cache: BlockBTreePageCache<Pst>,
+    max_value_size: AtomicU64,
 }
 
 pub struct UnicodePstFile {
@@ -458,6 +466,12 @@ impl UnicodePstFile {
         append_unicode_pst(path.as_ref(), messages, Some(folder_path))?;
         Self::open(path)
     }
+
+    /// MailCraft: a message's or an attachment's value of more than `bytes` is an error when
+    /// it is read, before any of it is read; a value can't be bigger than it declares anyway.
+    pub fn set_max_value_size(&self, bytes: u64) {
+        self.inner.max_value_size.store(bytes, Ordering::Relaxed);
+    }
 }
 
 impl PstFileLock<UnicodePstFile> for UnicodePstFile {
@@ -537,6 +551,10 @@ impl PstFile for UnicodePstFile {
     fn read_block(&self, block: UnicodeBlockId) -> io::Result<Vec<u8>> {
         self.inner.read_block(block)
     }
+
+    fn max_value_size(&self) -> u64 {
+        self.inner.max_value_size.load(Ordering::Relaxed)
+    }
 }
 
 pub struct AnsiPstFile {
@@ -552,6 +570,12 @@ impl AnsiPstFile {
     pub fn open(path: impl AsRef<Path>) -> io::Result<Self> {
         let inner = PstFileInner::open(path)?;
         Ok(Self { inner })
+    }
+
+    /// MailCraft: a message's or an attachment's value of more than `bytes` is an error when
+    /// it is read, before any of it is read; a value can't be bigger than it declares anyway.
+    pub fn set_max_value_size(&self, bytes: u64) {
+        self.inner.max_value_size.store(bytes, Ordering::Relaxed);
     }
 }
 
@@ -631,6 +655,10 @@ impl PstFile for AnsiPstFile {
 
     fn read_block(&self, block: AnsiBlockId) -> io::Result<Vec<u8>> {
         self.inner.read_block(block)
+    }
+
+    fn max_value_size(&self) -> u64 {
+        self.inner.max_value_size.load(Ordering::Relaxed)
     }
 }
 
@@ -6321,6 +6349,7 @@ where
             density_list,
             node_cache: Default::default(),
             block_cache: Default::default(),
+            max_value_size: AtomicU64::new(u64::MAX),
         })
     }
 

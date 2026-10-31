@@ -275,8 +275,16 @@ where
                 .into_iter()
                 .filter(|(prop_id, _)| prop_ids.is_none_or(|ids| ids.contains(prop_id)))
                 .map(|(prop_id, record)| {
+                    // MailCraft: under the file's limit.
                     prop_context
-                        .read_property(file, encoding, &block_btree, &mut page_cache, record)
+                        .read_property_capped(
+                            file,
+                            encoding,
+                            &block_btree,
+                            &mut page_cache,
+                            record,
+                            pst.max_value_size(),
+                        )
                         .map(|value| (prop_id, value))
                 })
                 .collect::<io::Result<BTreeMap<_, _>>>()?;

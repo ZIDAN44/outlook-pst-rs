@@ -113,6 +113,8 @@ pub enum NdbError {
     InvalidSubNodeBlockPadding(u32),
     #[error("Sub-node not found: {0:?}")]
     SubNodeNotFound(NodeId),
+    #[error("Data tree of 0x{0:X} bytes is over the limit of 0x{1:X}")]
+    DataTreeTooLarge(u64, u64),
 }
 
 impl From<NdbError> for io::Error {

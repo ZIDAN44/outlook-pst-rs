@@ -1036,6 +1036,7 @@ where
         block_btree: &PstFileReadWriteBlockBTree<Pst>,
         page_cache: &mut RootBTreePageCache<<Pst as PstFile>::BlockBTree>,
         value: PropertyTreeRecordValue,
+        limit: u64,
     ) -> io::Result<PropertyValue> {
         match value.value() {
             PropertyValueRecord::Heap(heap_id) => {
@@ -1066,12 +1067,17 @@ where
                     Some(data_tree) => data_tree,
                     None => DataTree::read(f, encoding, &block)?,
                 };
-                let mut data = vec![];
-                let result = data_tree
-                    .reader(f, encoding, block_btree, page_cache, &mut block_cache)
-                    .and_then(|mut r| r.read_to_end(&mut data));
+                // MailCraft: no more than the tree declares, nor than the caller's limit.
+                let result = data_tree.read_capped(
+                    f,
+                    encoding,
+                    block_btree,
+                    page_cache,
+                    &mut block_cache,
+                    limit,
+                );
                 block_cache.insert(block.block().block(), data_tree);
-                let _ = result?;
+                let data = result?;
                 let mut cursor = Cursor::new(data);
                 PropertyValueReadWrite::read(&mut cursor, value.prop_type())
             }
@@ -1138,7 +1144,20 @@ impl PropertyContextReadWrite<UnicodePstFile> for UnicodePropertyContext {
         value: PropertyTreeRecordValue,
     ) -> io::Result<PropertyValue> {
         self.inner
-            .read_property(f, encoding, block_btree, page_cache, value)
+            .read_property(f, encoding, block_btree, page_cache, value, u64::MAX)
+    }
+
+    fn read_property_capped<R: PstReader>(
+        &self,
+        f: &mut R,
+        encoding: NdbCryptMethod,
+        block_btree: &UnicodeBlockBTree,
+        page_cache: &mut RootBTreePageCache<UnicodeBlockBTree>,
+        value: PropertyTreeRecordValue,
+        limit: u64,
+    ) -> io::Result<PropertyValue> {
+        self.inner
+            .read_property(f, encoding, block_btree, page_cache, value, limit)
     }
 }
 
@@ -1195,6 +1214,19 @@ impl PropertyContextReadWrite<AnsiPstFile> for AnsiPropertyContext {
         value: PropertyTreeRecordValue,
     ) -> io::Result<PropertyValue> {
         self.inner
-            .read_property(f, encoding, block_btree, page_cache, value)
+            .read_property(f, encoding, block_btree, page_cache, value, u64::MAX)
+    }
+
+    fn read_property_capped<R: PstReader>(
+        &self,
+        f: &mut R,
+        encoding: NdbCryptMethod,
+        block_btree: &AnsiBlockBTree,
+        page_cache: &mut RootBTreePageCache<AnsiBlockBTree>,
+        value: PropertyTreeRecordValue,
+        limit: u64,
+    ) -> io::Result<PropertyValue> {
+        self.inner
+            .read_property(f, encoding, block_btree, page_cache, value, limit)
     }
 }

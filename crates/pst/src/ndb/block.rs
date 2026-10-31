@@ -378,6 +378,10 @@ impl IntermediateTreeHeaderReadWrite for DataTreeBlockHeader {
         }
 
         let level = f.read_u8()?;
+        // MailCraft: an XBLOCK is level 1 and an XXBLOCK level 2; nothing is deeper.
+        if !(1..=2).contains(&level) {
+            return Err(NdbError::InvalidInternalBlockLevel(level).into());
+        }
         let entry_count = f.read_u16::<LittleEndian>()?;
         let total_size = f.read_u32::<LittleEndian>()?;
 
@@ -694,6 +698,7 @@ where
                             Self::read(&mut *f, encoding, &data_block)?
                         }
                     };
+                    data_tree.below(block.header().level())?;
                     let entries = data_tree
                         .blocks(f, encoding, block_btree, page_cache, block_cache)
                         .map(|blocks| blocks.collect::<Vec<_>>());
@@ -800,6 +805,65 @@ where
         Ok(reader)
     }
 
+    /// MailCraft: the size the tree says it holds, the top XBLOCK's `lcbTotal` (a single data
+    /// block holds what it holds).
+    pub fn declared_size(&self) -> u64 {
+        match self {
+            Self::Intermediate(block) => u64::from(block.header().total_size()),
+            Self::Leaf(block) => block.data().len() as u64,
+        }
+    }
+
+    /// MailCraft: the tree's bytes, read up to the size it declares, or an error when that is
+    /// over `limit`. Blocks named twice, or a tree that points back at itself, can't make the
+    /// read any bigger than the size declared.
+    pub fn read_capped<'a, R>(
+        &self,
+        f: &'a mut R,
+        encoding: NdbCryptMethod,
+        block_btree: &'a PstFileReadWriteBlockBTree<Pst>,
+        page_cache: &mut RootBTreePageCache<<Pst as PstFile>::BlockBTree>,
+        block_cache: &'a mut DataBlockCache<Pst>,
+        limit: u64,
+    ) -> io::Result<Vec<u8>>
+    where
+        Pst: 'a,
+        R: PstReader,
+        <Pst as PstFile>::DataBlock: 'a + Clone,
+        <Pst as PstFile>::BTreeKey: BTreePageKeyReadWrite,
+        <Pst as PstFile>::BlockBTree: RootBTreeReadWrite,
+        <<Pst as PstFile>::BlockBTree as RootBTree>::Entry: BTreeEntryReadWrite,
+        <<Pst as PstFile>::BlockBTree as RootBTree>::IntermediatePage:
+            RootBTreeIntermediatePageReadWrite<
+                Pst,
+                <<Pst as PstFile>::BlockBTree as RootBTree>::Entry,
+                <<Pst as PstFile>::BlockBTree as RootBTree>::LeafPage,
+            >,
+        <<Pst as PstFile>::BlockBTree as RootBTree>::LeafPage:
+            RootBTreeLeafPageReadWrite<Pst> + BTreePageReadWrite,
+    {
+        let declared = self.declared_size();
+        if declared > limit {
+            return Err(NdbError::DataTreeTooLarge(declared, limit).into());
+        }
+        let mut data = Vec::new();
+        self.reader(f, encoding, block_btree, page_cache, block_cache)?
+            .take(declared)
+            .read_to_end(&mut data)?;
+        Ok(data)
+    }
+
+    /// MailCraft: a block an intermediate block of `level` points at is a level below it, so a
+    /// tree that points back at itself ends in an error rather than a stack overflow.
+    fn below(&self, level: u8) -> io::Result<()> {
+        match self {
+            Self::Intermediate(block) if block.header().level() >= level => {
+                Err(NdbError::InvalidInternalBlockLevel(block.header().level()).into())
+            }
+            _ => Ok(()),
+        }
+    }
+
     fn sub_entries<'a, R>(
         &self,
         f: &mut R,
@@ -843,6 +907,7 @@ where
                                 Self::read(&mut *f, encoding, &data_block)?
                             }
                         };
+                        data_tree.below(block.header().level())?;
                         let entries = data_tree
                             .sub_entries(f, encoding, block_btree, page_cache, block_cache)
                             .map(|entries| entries.collect::<Vec<_>>());
@@ -1369,6 +1434,11 @@ where
             )?;
         cursor.seek(SeekFrom::Start(0))?;
 
+        // MailCraft: an SLBLOCK is level 0 and an SIBLOCK level 1; nothing is deeper.
+        if header.level() > 1 {
+            return Err(NdbError::InvalidInternalBlockLevel(header.level()).into());
+        }
+
         if header.level() > 0 {
             let block =
                 <<Pst as PstFile>::SubNodeTreeBlock as IntermediateTreeBlockReadWrite>::read(
@@ -1397,6 +1467,17 @@ where
         match self {
             Self::Intermediate(block) => block.write(f),
             Self::Leaf(block) => block.write(f),
+        }
+    }
+
+    /// MailCraft: what an SIBLOCK points at is an SLBLOCK, so a tree that points back at itself
+    /// ends in an error rather than a stack overflow.
+    fn leaf(self) -> io::Result<Self> {
+        match self {
+            Self::Intermediate(block) => {
+                Err(NdbError::InvalidInternalBlockLevel(block.header().level()).into())
+            }
+            leaf => Ok(leaf),
         }
     }
 
@@ -1435,7 +1516,7 @@ where
                     .and_then(|index| entries.get(index))
                     .ok_or(NdbError::SubNodeNotFound(node))?;
                 let block = block_btree.find_entry(f, entry.block().search_key(), page_cache)?;
-                let page = Self::read(f, &block)?;
+                let page = Self::read(f, &block)?.leaf()?;
                 page.find_entry(f, block_btree, node, page_cache)
             }
             Self::Leaf(block) => {
@@ -1483,7 +1564,7 @@ where
                     .map(|entry| {
                         let block =
                             block_btree.find_entry(f, entry.block().search_key(), page_cache)?;
-                        let sub_nodes = Self::read(f, &block)?;
+                        let sub_nodes = Self::read(f, &block)?.leaf()?;
                         sub_nodes.entries(f, block_btree, page_cache)
                     })
                     .collect::<io::Result<Vec<_>>>()?;
@@ -1499,3 +1580,57 @@ where
 
 pub type UnicodeSubNodeTree = SubNodeTree<UnicodePstFile>;
 pub type AnsiSubNodeTree = SubNodeTree<AnsiPstFile>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(size: u16) -> UnicodeBlockBTreeEntry {
+        let block = UnicodeBlockId::new(true, 1).unwrap();
+        UnicodeBlockBTreeEntry::new(UnicodeBlockRef::new(block, UnicodeByteIndex::new(0)), size)
+    }
+
+    /// MailCraft: an XBLOCK is level 1 and an XXBLOCK level 2, and nothing else reads.
+    #[test]
+    fn a_data_tree_is_one_or_two_levels() {
+        for (level, ok) in [(0, false), (1, true), (2, true), (3, false), (0xFF, false)] {
+            let data = [0x01, level, 0, 0, 0, 0, 0, 0];
+            let header = DataTreeBlockHeader::read(&mut Cursor::new(&data[..]));
+            assert_eq!(header.is_ok(), ok, "level {level}");
+        }
+    }
+
+    /// MailCraft: an SLBLOCK is level 0 and an SIBLOCK level 1; a deeper one is an error before
+    /// anything under it is read.
+    #[test]
+    fn a_sub_node_tree_is_one_or_two_levels() {
+        // A well-formed SIBLOCK with one entry: level 1 reads, level 2 doesn't.
+        let block = |level: u8| {
+            let mut data = vec![0x02, level, 1, 0, 0, 0, 0, 0];
+            data.extend(0x21_u64.to_le_bytes()); // nid
+            data.extend(u64::from(UnicodeBlockId::new(false, 2).unwrap()).to_le_bytes());
+            let crc = crate::crc::compute_crc(0, &data);
+            data.resize(48, 0);
+            data.extend(24_u16.to_le_bytes());
+            data.extend(0_u16.to_le_bytes());
+            data.extend(crc.to_le_bytes());
+            data.extend(u64::from(UnicodeBlockId::new(true, 1).unwrap()).to_le_bytes());
+            UnicodeSubNodeTree::read(&mut Cursor::new(data), &entry(24))
+        };
+        assert!(matches!(block(1), Ok(SubNodeTree::Intermediate(_))));
+        assert!(block(2).is_err());
+    }
+
+    /// MailCraft: a cEnt that can't fit, or a block smaller than its header, is an error (the
+    /// sizes used to be multiplied and subtracted in u16).
+    #[test]
+    fn an_entry_count_that_cannot_fit_is_an_error() {
+        let header = UnicodeSubNodeTreeBlockHeader::new(0, 0xFFFF);
+        let data = vec![0; 64];
+        let block = UnicodeLeafSubNodeTreeBlock::read(&mut Cursor::new(data.clone()), header, 32);
+        assert!(block.is_err());
+        let header = UnicodeSubNodeTreeBlockHeader::new(0, 0);
+        let block = UnicodeLeafSubNodeTreeBlock::read(&mut Cursor::new(data), header, 4);
+        assert!(block.is_err());
+    }
+}

@@ -671,11 +671,19 @@ where
     fn read<R: PstReader>(f: &mut R, header: Self::Header, size: u16) -> io::Result<Self> {
         let mut data = vec![0; size as usize];
         f.read_exact(&mut data)?;
-        let mut cursor = Cursor::new(&data[Self::Header::HEADER_SIZE as usize..]);
+        // MailCraft: a block smaller than its header is an error, not a panic.
+        let entries_data = data
+            .get(Self::Header::HEADER_SIZE as usize..)
+            .ok_or(NdbError::InvalidBlockSize(size))?;
+        let mut cursor = Cursor::new(entries_data);
 
         let entry_count = header.entry_count();
 
-        if entry_count * Self::Entry::ENTRY_SIZE > size - Self::Header::HEADER_SIZE {
+        // MailCraft: in u32, so a large cEnt or a block smaller than its header is an error
+        // rather than an overflow.
+        if u32::from(entry_count) * u32::from(Self::Entry::ENTRY_SIZE)
+            > u32::from(size).saturating_sub(u32::from(Self::Header::HEADER_SIZE))
+        {
             return Err(NdbError::InvalidInternalBlockEntryCount(entry_count).into());
         }
 

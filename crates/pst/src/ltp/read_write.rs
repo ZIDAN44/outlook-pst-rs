@@ -61,6 +61,17 @@ where
         page_cache: &mut RootBTreePageCache<<Pst as PstFile>::BlockBTree>,
         value: PropertyTreeRecordValue,
     ) -> io::Result<PropertyValue>;
+    /// MailCraft: [`Self::read_property`], with an error for a value kept in a data tree of more
+    /// than `limit` bytes, before any of it is read.
+    fn read_property_capped<R: PstReader>(
+        &self,
+        f: &mut R,
+        encoding: NdbCryptMethod,
+        block_btree: &PstFileReadWriteBlockBTree<Pst>,
+        page_cache: &mut RootBTreePageCache<<Pst as PstFile>::BlockBTree>,
+        value: PropertyTreeRecordValue,
+        limit: u64,
+    ) -> io::Result<PropertyValue>;
 }
 
 pub trait TableContextInfoReadWrite: Sized {
