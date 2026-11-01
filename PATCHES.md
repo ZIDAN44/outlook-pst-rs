@@ -25,13 +25,17 @@ pins its revisions. Drop the fork once a release has all of the fixes.
 Every changed line is marked `MailCraft:` in a comment, with a test beside it.
 
 1. **Reads are capped** (`ndb/block.rs`, `ndb/page.rs`, `ndb/read_write.rs`, `ltp/heap.rs`,
-   `ltp/prop_context.rs`, `ltp/table_context.rs`, `messaging/search.rs`, `lib.rs`):
+   `ltp/prop_context.rs`, `ltp/table_context.rs`, `messaging/message.rs`, `messaging/attachment.rs`,
+   `messaging/store.rs`, `messaging/folder.rs`, `messaging/named_prop.rs`, `messaging/search.rs`,
+   `lib.rs`):
    - every data tree is read up to the size its XBLOCK declares: `DataTree::reader` stops there,
      and `blocks()` and the reader's list of blocks stop naming blocks once that much is named,
      so blocks named over and over (an XXBLOCK's thousand entries naming one XBLOCK whose
      thousand name one block) can't make a value, a heap or a table's rows bigger than that;
-   - `UnicodePstFile::set_max_value_size` (and the Ansi twin) sets a limit for a message's and an
-     attachment's values (`PropertyContextReadWrite::read_property_capped`), a table's column
+   - `UnicodePstFile::set_max_value_size` (and the Ansi twin) sets a limit for the store's, a
+     folder's, the name-to-id map's, a message's and an attachment's values
+     (`PropertyContextReadWrite::read_property_capped`; nothing in the crate calls the uncapped
+     `read_property` any more), a table's column
      kept in a subnode and its row matrix, `read_block` and the search update queue
      (`DataTree::read_capped`): one declared bigger is an error before any of it is read;
      MailCraft sets 256 MB. A heap that declares more than 2^16 blocks can hold is an error;
@@ -67,6 +71,7 @@ Every changed line is marked `MailCraft:` in a comment, with a test beside it.
 Fixes 1 and 4 to 7 are also proved on whole files in MailCraft's
 `crates/net/src/data_files/pst/tests/reader.rs`: files made with `outlook-pst-rw` and changed
 byte by byte into an attachment that holds a message (found in its own subnode tree, or in the
-message's when its own is damaged), a zero-byte file, a data tree that says less than it holds,
-one that names one block over and over and one that points at itself, and a node B-tree page
-that points at itself, each read on a thread with a time limit.
+message's when its own is damaged), a zero-byte file, a store's and a name-to-id map's value
+over the file's limit, a data tree that says less than it holds, one that names one block over
+and over and one that points at itself, and a node B-tree page that points at itself, each read
+on a thread with a time limit.

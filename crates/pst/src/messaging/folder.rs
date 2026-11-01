@@ -213,8 +213,16 @@ where
                 .properties()?
                 .into_iter()
                 .map(|(prop_id, record)| {
+                    // MailCraft: under the file's limit.
                     prop_context
-                        .read_property(file, encoding, &block_btree, &mut block_page_cache, record)
+                        .read_property_capped(
+                            file,
+                            encoding,
+                            &block_btree,
+                            &mut block_page_cache,
+                            record,
+                            pst.max_value_size(),
+                        )
                         .map(|value| (prop_id, value))
                 })
                 .chain([
