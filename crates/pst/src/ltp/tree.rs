@@ -239,27 +239,12 @@ where
             return Ok(Default::default());
         }
 
-        let mut level = header.levels();
-        let mut next_level = vec![header.root()];
-
-        while level > 0 {
-            for heap_id in mem::take(&mut next_level).into_iter() {
-                let mut cursor = Cursor::new(self.heap.find_entry(heap_id)?);
-                while let Ok(row) = HeapTreeIntermediateEntry::<K>::read(&mut cursor) {
-                    // MailCraft: index records that point back up the tree multiply at every
-                    // level; a real tree never comes near this.
-                    if next_level.len() >= max_records::<K>() {
-                        return Err(LtpError::HeapTreeTooLarge(max_records::<K>()).into());
-                    }
-                    next_level.push(row.next_level());
-                }
-            }
-
-            level -= 1;
-        }
+        let leaves = leaves::<K>(header.root(), header.levels(), |heap_id| {
+            self.heap.find_entry(heap_id)
+        })?;
 
         let mut results = Vec::new();
-        for heap_id in mem::take(&mut next_level).into_iter() {
+        for heap_id in leaves {
             let records = leaf_records::<K, V>(self.heap.find_entry(heap_id)?);
             if results.len().saturating_add(records.len()) > max_records::<K>() {
                 return Err(LtpError::HeapTreeTooLarge(max_records::<K>()).into());
@@ -269,6 +254,35 @@ where
 
         Ok(results)
     }
+}
+
+/// MailCraft: the leaves under a BTH's `levels` index levels. Index records that point back up
+/// the tree multiply at every level, and the header can declare up to 255 levels, so every index
+/// record read, at any level, counts against one budget: a real tree never comes near it, and a
+/// damaged one can't keep the walk going level after level.
+fn leaves<'a, K>(
+    root: HeapId,
+    levels: u8,
+    find: impl Fn(HeapId) -> io::Result<&'a [u8]>,
+) -> io::Result<Vec<HeapId>>
+where
+    K: HeapTreeEntryKey + HeapNodePageReadWrite,
+{
+    let mut next_level = vec![root];
+    let mut read = 0_usize;
+    for _ in 0..levels {
+        for heap_id in mem::take(&mut next_level) {
+            let mut cursor = Cursor::new(find(heap_id)?);
+            while let Ok(row) = HeapTreeIntermediateEntry::<K>::read(&mut cursor) {
+                if read >= max_records::<K>() {
+                    return Err(LtpError::HeapTreeTooLarge(max_records::<K>()).into());
+                }
+                read += 1;
+                next_level.push(row.next_level());
+            }
+        }
+    }
+    Ok(next_level)
 }
 
 /// MailCraft: the most records read from one BTH, at any level.
@@ -454,5 +468,34 @@ mod tests {
     fn a_tree_holds_no_more_records_than_it_has_keys() {
         assert_eq!(max_records::<PropertyTreeRecordKey>(), 1 << 16);
         assert_eq!(max_records::<crate::ltp::table_context::TableRowId>(), MAX_HEAP_TREE_RECORDS);
+    }
+
+    /// An index record: a u16 key, then the HID of the level below.
+    fn index_record(key: u16, hid: u32) -> Vec<u8> {
+        [&key.to_le_bytes()[..], &hid.to_le_bytes()].concat()
+    }
+
+    /// MailCraft: 255 index levels whose records never multiply (300 at every level, each
+    /// naming an allocation whose one record names itself) once read 300 records a level for
+    /// every level the header declared; they now count against one budget for the whole walk.
+    #[test]
+    fn index_levels_that_point_back_at_themselves_stop_at_one_budget() {
+        let (root, looping, leaf) = (0x20_u32, 0x40_u32, 0x60_u32);
+        let wide: Vec<u8> = (0..300).flat_map(|k| index_record(k, looping)).collect();
+        let back = index_record(0, looping);
+        let find = |hid: HeapId| -> io::Result<&[u8]> {
+            match u32::from(hid) {
+                0x20 => Ok(&wide),
+                0x40 => Ok(&back),
+                _ => Ok(&[]),
+            }
+        };
+        let walk = leaves::<PropertyTreeRecordKey>(HeapId::from(root), 255, find);
+        assert!(walk.is_err_and(|e| e.to_string().contains("more than 65536")));
+        // A real two-level tree: the root's records name the leaves.
+        let two = [index_record(0, leaf), index_record(9, leaf)].concat();
+        let find = |_: HeapId| -> io::Result<&[u8]> { Ok(&two) };
+        let walk = leaves::<PropertyTreeRecordKey>(HeapId::from(root), 1, find).unwrap();
+        assert_eq!(walk.iter().map(|h| u32::from(*h)).collect::<Vec<_>>(), [leaf, leaf]);
     }
 }

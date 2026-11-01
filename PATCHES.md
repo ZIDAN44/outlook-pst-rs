@@ -53,7 +53,9 @@ Every changed line is marked `MailCraft:` in a comment, with a test beside it.
    its own fixed-size slot (key and value sizes from the BTH header), and one that fails is left
    out with a warning. The scan used to stop there, so every property after it was lost (an
    attachment kept 0x0E20 and 0x3001 and lost its method). A BTH that yields more records than
-   its key size has keys (65,536 for a property context), or more than 2^24, is an error.
+   its key size has keys (65,536 for a property context), or more than 2^24, is an error, and
+   so is one whose index records, counted over all its levels (the header may declare 255),
+   come to more than that: records that point back up the tree can't keep the walk going.
    Test: `ltp::tree::tests`.
 4. **The object an attachment holds is looked up in its own subnode tree**
    (`messaging/attachment.rs`, `AttachmentInner::object_node`), where MS-PST keeps it, then in the
