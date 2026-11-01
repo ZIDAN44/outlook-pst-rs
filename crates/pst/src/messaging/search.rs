@@ -534,17 +534,17 @@ where
         let mut page_cache = Default::default();
         let block = block_btree.find_entry(file, key, &mut page_cache)?;
         let tree = DataTree::<Pst>::read(file, encoding, &block)?;
-        let mut data = Vec::new();
         let mut block_cache = Default::default();
-        let size = tree
-            .reader(
-                file,
-                encoding,
-                &block_btree,
-                &mut page_cache,
-                &mut block_cache,
-            )?
-            .read_to_end(&mut data)?;
+        // MailCraft: no more than the tree declares, nor than the file's limit.
+        let data = tree.read_capped(
+            file,
+            encoding,
+            &block_btree,
+            &mut page_cache,
+            &mut block_cache,
+            pst.max_value_size(),
+        )?;
+        let size = data.len();
 
         if size % SEARCH_UPDATE_SIZE as usize != 0 {
             return Err(MessagingError::InvalidSearchUpdateQueueSize(size).into());

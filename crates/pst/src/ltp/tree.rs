@@ -248,8 +248,8 @@ where
                 while let Ok(row) = HeapTreeIntermediateEntry::<K>::read(&mut cursor) {
                     // MailCraft: index records that point back up the tree multiply at every
                     // level; a real tree never comes near this.
-                    if next_level.len() >= MAX_HEAP_TREE_RECORDS {
-                        return Err(LtpError::HeapTreeTooLarge(MAX_HEAP_TREE_RECORDS).into());
+                    if next_level.len() >= max_records::<K>() {
+                        return Err(LtpError::HeapTreeTooLarge(max_records::<K>()).into());
                     }
                     next_level.push(row.next_level());
                 }
@@ -261,8 +261,8 @@ where
         let mut results = Vec::new();
         for heap_id in mem::take(&mut next_level).into_iter() {
             let records = leaf_records::<K, V>(self.heap.find_entry(heap_id)?);
-            if results.len().saturating_add(records.len()) > MAX_HEAP_TREE_RECORDS {
-                return Err(LtpError::HeapTreeTooLarge(MAX_HEAP_TREE_RECORDS).into());
+            if results.len().saturating_add(records.len()) > max_records::<K>() {
+                return Err(LtpError::HeapTreeTooLarge(max_records::<K>()).into());
             }
             results.extend(records);
         }
@@ -273,6 +273,14 @@ where
 
 /// MailCraft: the most records read from one BTH, at any level.
 const MAX_HEAP_TREE_RECORDS: usize = 1 << 24;
+
+/// MailCraft: the most records a BTH keyed by `K` can hold: one per key (a property context's
+/// u16 ids stop at 65,536), and never more than `MAX_HEAP_TREE_RECORDS`.
+fn max_records<K: HeapTreeEntryKey>() -> usize {
+    1_usize
+        .checked_shl(8 * u32::from(K::SIZE))
+        .map_or(MAX_HEAP_TREE_RECORDS, |keys| keys.min(MAX_HEAP_TREE_RECORDS))
+}
 
 /// MailCraft: the records of one leaf, each read from its own fixed-size slot. A record that
 /// doesn't parse (a property type this crate doesn't know) is skipped: it used to end the scan,
@@ -438,5 +446,13 @@ mod tests {
         let object = rows[1].data();
         assert_eq!(object.prop_type(), PropertyType::Object);
         assert!(matches!(object.value(), PropertyValueRecord::Heap(h) if u32::from(h) == 0x20));
+    }
+
+    /// MailCraft: a property context's records stop at one per u16 id, so index records that
+    /// point back at one leaf end there, not at 2^24; a table's row index can be larger.
+    #[test]
+    fn a_tree_holds_no_more_records_than_it_has_keys() {
+        assert_eq!(max_records::<PropertyTreeRecordKey>(), 1 << 16);
+        assert_eq!(max_records::<crate::ltp::table_context::TableRowId>(), MAX_HEAP_TREE_RECORDS);
     }
 }

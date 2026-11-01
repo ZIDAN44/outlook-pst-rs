@@ -4,7 +4,6 @@ use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use std::{
     collections::{btree_map, BTreeMap, VecDeque},
     io::{self, Cursor, Read, Seek, SeekFrom, Write},
-    iter,
 };
 use tracing::error;
 
@@ -683,10 +682,56 @@ where
         <<Pst as PstFile>::BlockBTree as RootBTree>::LeafPage:
             RootBTreeLeafPageReadWrite<Pst> + BTreePageReadWrite,
     {
+        // MailCraft: no more blocks than the size the tree declares.
+        let mut budget = self.declared_size();
+        let blocks = self.blocks_within(
+            f,
+            encoding,
+            block_btree,
+            page_cache,
+            block_cache,
+            &mut budget,
+        )?;
+        Ok(Box::new(blocks.into_iter()))
+    }
+
+    /// MailCraft: the leaf blocks under this one until `budget` bytes are taken, so blocks named
+    /// over and over can't make a tree hold more than it declares.
+    fn blocks_within<R>(
+        &self,
+        f: &mut R,
+        encoding: NdbCryptMethod,
+        block_btree: &PstFileReadWriteBlockBTree<Pst>,
+        page_cache: &mut RootBTreePageCache<<Pst as PstFile>::BlockBTree>,
+        block_cache: &mut DataBlockCache<Pst>,
+        budget: &mut u64,
+    ) -> io::Result<Vec<<Pst as PstFile>::DataBlock>>
+    where
+        R: PstReader,
+        <Pst as PstFile>::DataBlock: Clone,
+        <Pst as PstFile>::BlockId: BlockId<Index = <Pst as PstFile>::BTreeKey> + BlockIdReadWrite,
+        <Pst as PstFile>::ByteIndex: ByteIndexReadWrite,
+        <Pst as PstFile>::BlockRef: BlockRefReadWrite,
+        <Pst as PstFile>::PageTrailer: PageTrailerReadWrite,
+        <Pst as PstFile>::BTreeKey: BTreePageKeyReadWrite,
+        <Pst as PstFile>::BlockBTree: RootBTreeReadWrite,
+        <<Pst as PstFile>::BlockBTree as RootBTree>::Entry: BTreeEntryReadWrite,
+        <<Pst as PstFile>::BlockBTree as RootBTree>::IntermediatePage:
+            RootBTreeIntermediatePageReadWrite<
+                Pst,
+                <<Pst as PstFile>::BlockBTree as RootBTree>::Entry,
+                <<Pst as PstFile>::BlockBTree as RootBTree>::LeafPage,
+            >,
+        <<Pst as PstFile>::BlockBTree as RootBTree>::LeafPage:
+            RootBTreeLeafPageReadWrite<Pst> + BTreePageReadWrite,
+    {
         match self {
             Self::Intermediate(block, ..) => {
-                let mut blocks = Vec::with_capacity(block.entries().len());
+                let mut blocks = Vec::new();
                 for entry in block.entries() {
+                    if *budget == 0 {
+                        break;
+                    }
                     let data_tree = match block_cache.remove(&entry.block()) {
                         Some(entry) => entry,
                         None => {
@@ -699,15 +744,23 @@ where
                         }
                     };
                     data_tree.below(block.header().level())?;
-                    let entries = data_tree
-                        .blocks(f, encoding, block_btree, page_cache, block_cache)
-                        .map(|blocks| blocks.collect::<Vec<_>>());
+                    let entries = data_tree.blocks_within(
+                        f,
+                        encoding,
+                        block_btree,
+                        page_cache,
+                        block_cache,
+                        budget,
+                    );
                     block_cache.insert(entry.block(), data_tree);
-                    blocks.push(entries?);
+                    blocks.extend(entries?);
                 }
-                Ok(Box::new(blocks.into_iter().flatten()))
+                Ok(blocks)
             }
-            Self::Leaf(block) => Ok(Box::new(Some(block.as_ref()).cloned().into_iter())),
+            Self::Leaf(block) => {
+                *budget = budget.saturating_sub(block.data().len() as u64);
+                Ok(vec![block.as_ref().clone()])
+            }
         }
     }
 
@@ -740,8 +793,17 @@ where
     {
         Ok(Some(match self {
             Self::Intermediate(_) => {
+                let mut budget = self.declared_size();
                 let Some(data_block) = self
-                    .sub_entries(f, encoding, block_btree, page_cache, block_cache)?
+                    .sub_entries(
+                        f,
+                        encoding,
+                        block_btree,
+                        page_cache,
+                        block_cache,
+                        &mut budget,
+                    )?
+                    .into_iter()
                     .nth(n)
                 else {
                     return Ok(None);
@@ -801,7 +863,8 @@ where
     {
         let reader: DataTreeReader<'a, Pst, R> =
             DataTreeReader::new(self, f, encoding, block_btree, page_cache, block_cache)?;
-        let reader: Box<dyn 'a + Read> = Box::new(reader);
+        // MailCraft: no more than the tree declares.
+        let reader: Box<dyn 'a + Read> = Box::new(reader.take(self.declared_size()));
         Ok(reader)
     }
 
@@ -864,17 +927,19 @@ where
         }
     }
 
-    fn sub_entries<'a, R>(
+    /// The leaf blocks under this one. MailCraft: until `budget` bytes are named, so blocks
+    /// named over and over can't make a tree hold more than it declares.
+    fn sub_entries<R>(
         &self,
         f: &mut R,
         encoding: NdbCryptMethod,
         block_btree: &PstFileReadWriteBlockBTree<Pst>,
         page_cache: &mut RootBTreePageCache<<Pst as PstFile>::BlockBTree>,
-        block_cache: &'a mut DataBlockCache<Pst>,
-    ) -> io::Result<Box<dyn 'a + Iterator<Item = <Pst as PstFile>::BlockBTreeEntry>>>
+        block_cache: &mut DataBlockCache<Pst>,
+        budget: &mut u64,
+    ) -> io::Result<Vec<<Pst as PstFile>::BlockBTreeEntry>>
     where
         R: PstReader,
-        <Pst as PstFile>::BlockBTreeEntry: 'a,
         <Pst as PstFile>::BlockId: BlockId<Index = <Pst as PstFile>::BTreeKey> + BlockIdReadWrite,
         <Pst as PstFile>::ByteIndex: ByteIndexReadWrite,
         <Pst as PstFile>::BlockRef: BlockRefReadWrite,
@@ -893,8 +958,11 @@ where
     {
         match self {
             Self::Intermediate(block, ..) => {
-                let mut blocks = Vec::with_capacity(block.entries().len());
+                let mut blocks = Vec::new();
                 for entry in block.entries() {
+                    if *budget == 0 {
+                        break;
+                    }
                     if entry.block().is_internal() {
                         let data_tree = match block_cache.remove(&entry.block()) {
                             Some(entry) => entry,
@@ -908,20 +976,26 @@ where
                             }
                         };
                         data_tree.below(block.header().level())?;
-                        let entries = data_tree
-                            .sub_entries(f, encoding, block_btree, page_cache, block_cache)
-                            .map(|entries| entries.collect::<Vec<_>>());
+                        let entries = data_tree.sub_entries(
+                            f,
+                            encoding,
+                            block_btree,
+                            page_cache,
+                            block_cache,
+                            budget,
+                        );
                         block_cache.insert(entry.block(), data_tree);
-                        blocks.push(entries?);
+                        blocks.extend(entries?);
                     } else {
                         let data_block =
                             block_btree.find_entry(f, entry.block().search_key(), page_cache)?;
-                        blocks.push(vec![data_block]);
+                        *budget = budget.saturating_sub(u64::from(data_block.size()));
+                        blocks.push(data_block);
                     }
                 }
-                Ok(Box::new(blocks.into_iter().flatten()))
+                Ok(blocks)
             }
-            Self::Leaf(_) => Ok(Box::new(iter::empty())),
+            Self::Leaf(_) => Ok(Vec::new()),
         }
     }
 }
@@ -981,9 +1055,17 @@ where
     {
         let cursor = match data_tree {
             DataTree::Intermediate(_) => {
+                let mut budget = data_tree.declared_size();
                 let next = data_tree
-                    .sub_entries(file, encoding, block_btree, page_cache, block_cache)?
-                    .collect();
+                    .sub_entries(
+                        file,
+                        encoding,
+                        block_btree,
+                        page_cache,
+                        block_cache,
+                        &mut budget,
+                    )?
+                    .into();
 
                 DataTreeCursor {
                     current: Default::default(),

@@ -19,6 +19,9 @@ use crate::{
 
 pub const HEAP_INDEX_MASK: u32 = (1_u16.rotate_right(5) - 1) as u32;
 
+/// MailCraft: the most a heap can hold: 2^16 blocks (`hidBlockIndex`) of at most 8 KiB.
+const MAX_HEAP_SIZE: u64 = (1 << 16) * 8192;
+
 /// [HID](https://learn.microsoft.com/en-us/openspecs/office_file_formats/ms-pst/85b9e985-ea53-447f-b70c-eb82bfbdcbc9)
 #[derive(Clone, Copy, Default, Debug)]
 pub struct HeapId(NodeId);
@@ -554,6 +557,14 @@ where
     ) -> io::Result<Self> {
         let block = block_btree.find_entry(f, key, page_cache)?;
         let data_tree = DataTree::<Pst>::read(f, encoding, &block)?;
+        // MailCraft: a HID names one of at most 2^16 blocks, so a heap that declares more than
+        // they can hold is damaged; an error before any of it is read.
+        if data_tree.declared_size() > MAX_HEAP_SIZE {
+            return Err(
+                crate::ndb::NdbError::DataTreeTooLarge(data_tree.declared_size(), MAX_HEAP_SIZE)
+                    .into(),
+            );
+        }
         let data = data_tree
             .blocks(
                 f,

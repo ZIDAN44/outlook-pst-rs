@@ -7028,17 +7028,15 @@ where
         let block = block_btree.find_entry(reader, block.search_key(), &mut page_cache)?;
         let block = DataTree::<Pst>::read(reader, encoding, &block)?;
         let mut block_cache = Default::default();
-        let mut data = vec![];
-        let _ = block
-            .reader(
-                reader,
-                encoding,
-                &block_btree,
-                &mut page_cache,
-                &mut block_cache,
-            )?
-            .read_to_end(&mut data)?;
-        Ok(data)
+        // MailCraft: no more than the tree declares, nor than the file's limit.
+        block.read_capped(
+            reader,
+            encoding,
+            &block_btree,
+            &mut page_cache,
+            &mut block_cache,
+            self.max_value_size.load(Ordering::Relaxed),
+        )
     }
 }
 

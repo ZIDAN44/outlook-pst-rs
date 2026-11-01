@@ -954,6 +954,15 @@ where
                         Some(data_tree) => data_tree,
                         None => DataTree::read(file, encoding, &block)?,
                     };
+                    // MailCraft: the row matrix is under the file's limit, as a value is.
+                    let limit = store.pst().max_value_size();
+                    if data_tree.declared_size() > limit {
+                        return Err(crate::ndb::NdbError::DataTreeTooLarge(
+                            data_tree.declared_size(),
+                            limit,
+                        )
+                        .into());
+                    }
                     let result = data_tree
                         .blocks(
                             file,
@@ -1051,17 +1060,17 @@ where
                     Some(data_tree) => data_tree,
                     None => DataTree::read(file, encoding, &block)?,
                 };
-                let result = data_tree
-                    .reader(
-                        file,
-                        encoding,
-                        block_btree,
-                        &mut page_cache,
-                        &mut block_cache,
-                    )
-                    .and_then(|mut r| PropertyValueReadWrite::read(&mut r, prop_type));
+                // MailCraft: no more than the tree declares, nor than the file's limit.
+                let result = data_tree.read_capped(
+                    file,
+                    encoding,
+                    block_btree,
+                    &mut page_cache,
+                    &mut block_cache,
+                    self.store.pst().max_value_size(),
+                );
                 block_cache.insert(block.block().block(), data_tree);
-                result
+                PropertyValueReadWrite::read(&mut Cursor::new(result?), prop_type)
             }
         }
     }

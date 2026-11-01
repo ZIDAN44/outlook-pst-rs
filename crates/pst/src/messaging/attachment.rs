@@ -383,7 +383,9 @@ where
     }
 
     /// MailCraft: the node of the object an attachment holds, looked up in the attachment's own
-    /// subnode tree (MS-PST 2.4.6.2), then in the message's, where this crate looked before.
+    /// subnode tree (MS-PST 2.4.6.2), then in the message's, where this crate looked before. An
+    /// own tree that can't be read is passed over, so a damaged one costs nothing that the
+    /// message's tree holds.
     fn object_node<R: PstReader>(
         file: &mut R,
         block_btree: &crate::PstFileReadWriteBlockBTree<Pst>,
@@ -394,10 +396,18 @@ where
     ) -> io::Result<<Pst as PstFile>::NodeBTreeEntry> {
         let own = match own_sub_nodes {
             Some(sub_nodes) => {
-                let block = block_btree.find_entry(file, sub_nodes.search_key(), page_cache)?;
-                SubNodeTree::<Pst>::read(file, &block)?
-                    .entries(file, block_btree, page_cache)?
-                    .find(|entry| u32::from(entry.node()) == u32::from(object))
+                let found = block_btree
+                    .find_entry(file, sub_nodes.search_key(), page_cache)
+                    .and_then(|block| SubNodeTree::<Pst>::read(file, &block))
+                    .and_then(|tree| {
+                        Ok(tree
+                            .entries(file, block_btree, page_cache)?
+                            .find(|entry| u32::from(entry.node()) == u32::from(object)))
+                    });
+                found.unwrap_or_else(|e| {
+                    tracing::warn!("an attachment's own subnode tree could not be read: {e}");
+                    None
+                })
             }
             None => None,
         };

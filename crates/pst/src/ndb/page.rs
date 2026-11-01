@@ -2276,6 +2276,7 @@ where
         let search_key: u64 = key.into();
         match self {
             Self::Intermediate(page, ..) => {
+                let level = <Self::IntermediatePage as BTreePage>::level(page);
                 let entries = <Self::IntermediatePage as BTreePage>::entries(page);
                 let index = entries.partition_point(|entry| entry.key().into() <= search_key);
                 let entry = index
@@ -2287,6 +2288,14 @@ where
                     Some(page) => page,
                     None => <Self as RootBTreeReadWrite>::read(f, block)?,
                 };
+                // MailCraft: the page an entry names is a level below this one, so a page that
+                // points back at itself is an error rather than a stack overflow.
+                if let Self::Intermediate(child, ..) = &page {
+                    let child = <Self::IntermediatePage as BTreePage>::level(child);
+                    if child >= level {
+                        return Err(NdbError::InvalidBTreePageLevel(child).into());
+                    }
+                }
                 let entry = page.find_entry(f, key, page_cache);
                 page_cache.insert(block.block(), page);
                 entry
