@@ -209,3 +209,15 @@ are the writer's own.
     Tests: `extra::attach::tests` (a message attached three deep with a file at the bottom,
     beside a file with properties of its own, read back with `UnicodeAttachment::embedded_message`;
     as deep as the limit and one past it).
+17. **A file read from a source as it is written** (`extra/attach.rs`, `lib.rs`): an
+    attachment's bytes were a slice, so a batch held every file it wrote whole, and the writer
+    held each file's blocks again until its message was done. `UnicodePstAttachmentContent::Source`
+    gives a file by a `UnicodePstAttachmentSource`, its size and a reader opened as it is
+    written: its blocks go to the file 256 at a time (2 MB) as they are read, and its data tree,
+    an XXBLOCK over XBLOCKs past 1,021 blocks, is up to 2 GiB less 1 MB (`PidTagAttachSize` is a
+    signed 32-bit integer). A source that gives less or more than its size is an error, and the
+    file keeps what it had (the blocks written are in space the file doesn't count as taken).
+
+    Test: `extra::attach::tests::a_file_from_a_source_is_written_as_it_is_read` (20 MB through
+    an XXBLOCK with no more than 4 MB of blocks waiting at once, where the same bytes given whole
+    wait all together; read back byte for byte; sources that say more or less than they give).

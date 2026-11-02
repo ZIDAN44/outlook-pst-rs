@@ -295,3 +295,136 @@ fn attachments_that_cant_be_written_are_an_error() {
     assert_eq!(depth, MAX_EMBEDDED_DEPTH);
     std::fs::remove_file(path).unwrap();
 }
+
+/// `size` bytes of a pattern no two blocks share, made as they are read.
+struct Repeating(u64);
+
+impl UnicodePstAttachmentSource for Repeating {
+    fn size(&self) -> u64 {
+        self.0
+    }
+
+    fn open(&self) -> io::Result<Box<dyn Read + '_>> {
+        Ok(Box::new(Pattern { at: 0, end: self.0 }))
+    }
+}
+
+struct Pattern {
+    at: u64,
+    end: u64,
+}
+
+fn pattern(at: u64) -> u8 {
+    (at.wrapping_mul(2_654_435_761) >> 13) as u8
+}
+
+impl Read for Pattern {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = buf.len().min((self.end - self.at) as usize);
+        for (i, b) in buf[..n].iter_mut().enumerate() {
+            *b = pattern(self.at + i as u64);
+        }
+        self.at += n as u64;
+        Ok(n)
+    }
+}
+
+/// A source that gives `given` bytes and says it has `said`.
+struct Lying {
+    said: u64,
+    given: u64,
+}
+
+impl UnicodePstAttachmentSource for Lying {
+    fn size(&self) -> u64 {
+        self.said
+    }
+
+    fn open(&self) -> io::Result<Box<dyn Read + '_>> {
+        Ok(Box::new(Pattern {
+            at: 0,
+            end: self.given,
+        }))
+    }
+}
+
+/// A file read from a source past an XBLOCK's reach (1,021 blocks, 8.3 MB) is written as it is
+/// read, an XXBLOCK over its XBLOCKs: no more than a few MB of blocks wait to be written at once,
+/// where its bytes given whole wait all together. It reads back byte for byte. A source that
+/// gives less or more than it said is an error, and the file keeps what it had.
+#[test]
+fn a_file_from_a_source_is_written_as_it_is_read() {
+    const SIZE: u64 = 20 << 20;
+    let path = temp_pst("attached-source");
+    let source = Repeating(SIZE);
+    let file = UnicodePstAttachment {
+        filename: "big.bin",
+        mime_type: "application/octet-stream",
+        content: UnicodePstAttachmentContent::Source(&source),
+        ..Default::default()
+    };
+    MOST_PENDING.with(|most| most.set(0));
+    drop(
+        UnicodePstFile::create_with_attachments(
+            &path,
+            &message("Big", "<big@example.com>", &[]),
+            &[file],
+        )
+        .unwrap(),
+    );
+    let most = MOST_PENDING.with(|most| most.get());
+    assert!(most < 4 << 20, "{most} bytes waited");
+
+    let top = first_message(&path);
+    let files = attachments_of(&top);
+    assert!(
+        matches!(files[0].properties().get(0x0E20), Some(PropertyValue::Integer32(n)) if *n as u64 > SIZE)
+    );
+    let read = bytes(&files[0]);
+    assert_eq!(read.len() as u64, SIZE);
+    assert!(read
+        .iter()
+        .enumerate()
+        .all(|(i, b)| *b == pattern(i as u64)));
+    drop((files, top));
+
+    // The same bytes given whole wait to be written together.
+    let whole: Vec<u8> = (0..SIZE).map(pattern).collect();
+    MOST_PENDING.with(|most| most.set(0));
+    drop(
+        UnicodePstFile::append_with_attachments(
+            &path,
+            &message("Whole", "<whole@example.com>", &[]),
+            &[UnicodePstAttachment {
+                filename: "whole.bin",
+                data: &whole,
+                ..Default::default()
+            }],
+        )
+        .unwrap(),
+    );
+    assert!(MOST_PENDING.with(|most| most.get()) as u64 >= SIZE);
+
+    for (said, given) in [(100_000, 99_999), (100_000, 100_001)] {
+        let lying = Lying { said, given };
+        let before = std::fs::read(&path).unwrap();
+        let err = UnicodePstFile::append_with_attachments(
+            &path,
+            &message("Lying", "<lying@example.com>", &[]),
+            &[UnicodePstAttachment {
+                filename: "lying.bin",
+                content: UnicodePstAttachmentContent::Source(&lying),
+                ..Default::default()
+            }],
+        )
+        .err()
+        .unwrap();
+        assert!(err.to_string().contains("source"), "{err}");
+        // The blocks written went to free space: what the file had still reads.
+        assert_eq!(std::fs::read(&path).unwrap()[..0x200], before[..0x200]);
+        let store = UnicodeStore::read(Rc::new(UnicodePstFile::open(&path).unwrap())).unwrap();
+        let (_, inbox) = folder(&store, &["Inbox"]);
+        assert_eq!(messages(&store, &inbox).len(), 2);
+    }
+    std::fs::remove_file(path).unwrap();
+}

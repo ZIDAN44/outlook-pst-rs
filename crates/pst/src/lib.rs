@@ -30,8 +30,9 @@ mod extra;
 
 use extra::*;
 pub use extra::{
-    UnicodePstAttachmentContent, UnicodePstEmbeddedMessage, UnicodePstName, UnicodePstProperty,
-    UnicodePstPropertyKey, UnicodePstSpecialFolder, UnicodePstValue, MAX_EMBEDDED_DEPTH,
+    UnicodePstAttachmentContent, UnicodePstAttachmentSource, UnicodePstEmbeddedMessage,
+    UnicodePstName, UnicodePstProperty, UnicodePstPropertyKey, UnicodePstSpecialFolder,
+    UnicodePstValue, MAX_EMBEDDED_DEPTH,
 };
 
 use ltp::{
@@ -293,7 +294,8 @@ pub struct UnicodePstAttachment<'a> {
     pub content_id: Option<&'a str>,
     /// Exact attachment bytes.
     pub data: &'a [u8],
-    /// MailCraft: what the attachment holds when it isn't `data`: an attached message.
+    /// MailCraft: what the attachment holds when it isn't `data`: a file read from a source as
+    /// it is written, or an attached message.
     pub content: UnicodePstAttachmentContent<'a>,
     /// MailCraft: tagged properties of the attachment's own, in place of the writer's of the
     /// same ID (not its size, value or method).
@@ -3370,7 +3372,8 @@ fn write_new_block<W: Write + Seek>(
 
 /// MailCraft: a message's nodes as blocks: its property context (the data tree's block, the
 /// first returned), and in its subnode tree (the second) its recipient table, its values too big
-/// for its heap and its attachments, an attached message's own nodes alike.
+/// for its heap and its attachments, an attached message's own nodes alike. `flush` sends the
+/// blocks so far on to the file, so a big file read from a source is never held whole.
 #[allow(clippy::too_many_arguments)]
 fn push_message(
     blocks: &mut Vec<NewBlock>,
@@ -3383,6 +3386,7 @@ fn push_message(
     row_version: u32,
     message_size: i32,
     embedded_ids: &mut EmbeddedIds,
+    flush: &mut dyn FnMut(&mut Vec<NewBlock>) -> io::Result<()>,
 ) -> io::Result<(UnicodeBlockId, UnicodeBlockId)> {
     let (message_pages, message_properties) = message_data(
         input,
@@ -3413,6 +3417,7 @@ fn push_message(
         row_version,
         &mut message_subnodes,
         embedded_ids,
+        flush,
     )?;
     let message_subnode_bid = push_subnode_tree(blocks, next_bid, next_offset, message_subnodes)?;
     Ok((message_bid, message_subnode_bid))
@@ -3428,6 +3433,7 @@ fn push_attachments(
     row_version: u32,
     sub_nodes: &mut Vec<UnicodeLeafSubNodeTreeEntry>,
     embedded_ids: &mut EmbeddedIds,
+    flush: &mut dyn FnMut(&mut Vec<NewBlock>) -> io::Result<()>,
 ) -> io::Result<()> {
     if attachments.is_empty() {
         return Ok(());
@@ -3467,7 +3473,8 @@ fn push_attachments(
         .enumerate()
     {
         // MailCraft: an attached message's nodes go in the attachment's own subnode tree, under
-        // the node its PtypObject names (MS-PST 2.4.6.2).
+        // the node its PtypObject names (MS-PST 2.4.6.2); a file read from a source is read as
+        // it is written.
         let (data_node, object, attachment_subnode) = if let Some(message) = embedded(attachment) {
             let node = embedded_ids.take()?;
             let size = content
@@ -3485,6 +3492,7 @@ fn push_attachments(
                 row_version,
                 size,
                 embedded_ids,
+                flush,
             )?;
             let tree = push_block(
                 blocks,
@@ -3503,7 +3511,12 @@ fn push_attachments(
                 NodeIdType::Internal,
                 0x200 + u32::try_from(index).map_err(|_| PstError::IntegerConversion)?,
             )?;
-            let data_block = push_data_tree(blocks, next_bid, next_offset, attachment.data)?;
+            let data_block = match attachment.content {
+                UnicodePstAttachmentContent::Source(source) => {
+                    push_data_tree_source(blocks, next_bid, next_offset, source, *content, flush)?
+                }
+                _ => push_data_tree(blocks, next_bid, next_offset, attachment.data)?,
+            };
             let tree = push_block(
                 blocks,
                 next_bid,
@@ -3888,6 +3901,8 @@ fn write_pending_blocks(
     bbt_entries: &mut Vec<UnicodeBlockBTreeEntry>,
     blocks: &mut Vec<NewBlock>,
 ) -> io::Result<()> {
+    #[cfg(test)]
+    extra::note_pending(blocks);
     for block in blocks.drain(..) {
         bbt_entries.push(UnicodeBlockBTreeEntry::new(
             UnicodeBlockRef::new(block.id, UnicodeByteIndex::new(block.offset)),
@@ -4831,6 +4846,10 @@ fn append_unicode_pst(
     {
         let mut blocks = Vec::new();
         let result = (|| {
+            // MailCraft: blocks go on to the file as a big file is read, and at the end.
+            let mut flush = |blocks: &mut Vec<NewBlock>| {
+                write_pending_blocks(&mut file, &mut block_writer, &mut bbt_entries, blocks)
+            };
             let (message_bid, message_subnode_bid) = push_message(
                 &mut blocks,
                 &mut next_bid,
@@ -4842,8 +4861,9 @@ fn append_unicode_pst(
                 header.unique_value(),
                 *message_size,
                 &mut embedded_ids,
+                &mut flush,
             )?;
-            write_pending_blocks(&mut file, &mut block_writer, &mut bbt_entries, &mut blocks)?;
+            flush(&mut blocks)?;
             Ok::<_, io::Error>(UnicodeNodeBTreeEntry::new(
                 *message,
                 message_bid,

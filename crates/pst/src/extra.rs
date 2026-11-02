@@ -7,11 +7,16 @@ mod attach;
 mod folders;
 mod named;
 
+#[cfg(test)]
+pub(crate) use attach::note_pending;
 pub(crate) use attach::{
-    check_attachments, embedded, embedded_messages, file_size, sizing_node,
+    check_attachments, embedded, embedded_messages, file_size, push_data_tree_source, sizing_node,
     with_attachment_properties, EmbeddedIds, ATTACH_BY_VALUE, ATTACH_EMBEDDED_MESSAGE,
 };
-pub use attach::{UnicodePstAttachmentContent, UnicodePstEmbeddedMessage, MAX_EMBEDDED_DEPTH};
+pub use attach::{
+    UnicodePstAttachmentContent, UnicodePstAttachmentSource, UnicodePstEmbeddedMessage,
+    MAX_EMBEDDED_DEPTH,
+};
 pub use folders::UnicodePstSpecialFolder;
 pub(crate) use folders::MAIL_CONTAINER_CLASS;
 pub use named::UnicodePstName;
