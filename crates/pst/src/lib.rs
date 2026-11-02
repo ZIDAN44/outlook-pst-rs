@@ -1125,17 +1125,32 @@ fn encode_table_row(
     cells: Vec<Option<TableCell>>,
 ) -> io::Result<Vec<u8>> {
     let mut row = vec![0; usize::from(context.end_existence_bitmap())];
+    // MailCraft: a row too short for its ID and version is an error, not a panic.
+    if row.len() < 8 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "table rows are too short for their ID and version",
+        ));
+    }
     (&mut row[0..4]).write_u32::<byteorder::LittleEndian>(row_id.into())?;
     (&mut row[4..8]).write_u32::<byteorder::LittleEndian>(unique)?;
 
     for (column, cell) in context.columns().iter().zip(cells) {
         let Some(cell) = cell else { continue };
+        // MailCraft: a column the file places past the row is an error, not a panic.
+        let outside = || {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "table column lies outside its row",
+            )
+        };
         let bit = usize::from(column.existence_bitmap_index());
-        row[usize::from(context.end_1byte_values()) + bit / 8] |= 0x80 >> (bit % 8);
+        *row.get_mut(usize::from(context.end_1byte_values()) + bit / 8)
+            .ok_or_else(outside)? |= 0x80 >> (bit % 8);
 
         let offset = usize::from(column.offset());
         let size = usize::from(column.size());
-        let mut target = &mut row[offset..offset + size];
+        let mut target = row.get_mut(offset..offset + size).ok_or_else(outside)?;
         if table_pointer_type(column.prop_type()) {
             let value = match cell {
                 TableCell::Node(node) => u32::from(node),
@@ -1226,7 +1241,10 @@ fn take_row_index_spine(
         }
         if level > 0 {
             let last = data.len() - 8;
-            node = HeapId::from(u32::from_le_bytes(data[last + 4..].try_into().unwrap()));
+            // MailCraft: read without `unwrap`; the node's length is a multiple of 8 above.
+            let mut child = [0; 4];
+            child.copy_from_slice(data.get(last + 4..last + 8).unwrap_or(&[0; 4]));
+            node = HeapId::from(u32::from_le_bytes(child));
             data.truncate(last);
         }
         spine.push(data);
@@ -1259,7 +1277,10 @@ fn append_row_index_spine(
         children = data
             .chunks(ROW_INDEX_FANOUT * 8)
             .map(|chunk| {
-                let key = u32::from_le_bytes(chunk[..4].try_into().unwrap());
+                // MailCraft: without `unwrap`; every chunk holds whole 8-byte records.
+                let mut key = [0; 4];
+                key.copy_from_slice(chunk.get(..4).unwrap_or(&[0; 4]));
+                let key = u32::from_le_bytes(key);
                 Ok((key, heap.alloc(chunk.to_vec())?))
             })
             .collect::<io::Result<Vec<_>>>()?;
@@ -1273,6 +1294,7 @@ fn append_row_index_spine(
 #[allow(clippy::too_many_arguments)]
 fn patch_table_row(
     file: &mut File,
+    encoding: NdbCryptMethod,
     bbt_entries: &[UnicodeBlockBTreeEntry],
     table: &dyn TableContext,
     rows_block: Option<UnicodeBlockId>,
@@ -1320,20 +1342,28 @@ fn patch_table_row(
         ));
     }
 
-    let mut leaves = data_tree_leaves(file, bbt_entries, rows_block)?;
+    let mut leaves = data_tree_leaves(file, encoding, bbt_entries, rows_block)?;
     let rows_per_block = MAX_DATA_BLOCK_SIZE / row_size;
     let Some(&(leaf, _)) = leaves.get(position / rows_per_block) else {
         return Ok(None);
     };
-    let mut data = read_data_block(file, bbt_entries, leaf)?;
+    let mut data = read_data_block(file, encoding, bbt_entries, leaf)?;
     let start = position % rows_per_block * row_size;
     let Some(row_data) = data.get_mut(start..start + row_size) else {
         return Ok(None);
     };
     for (offset, bytes, bit) in patches {
-        row_data[offset..offset + bytes.len()].copy_from_slice(&bytes);
+        // MailCraft: a column the file places past its row falls back to the rebuild.
+        let Some(cell) = row_data.get_mut(offset..offset + bytes.len()) else {
+            return Ok(None);
+        };
+        cell.copy_from_slice(&bytes);
         if let Some(bit) = bit {
-            row_data[usize::from(context.end_1byte_values()) + bit / 8] |= 0x80 >> (bit % 8);
+            let Some(flags) = row_data.get_mut(usize::from(context.end_1byte_values()) + bit / 8)
+            else {
+                return Ok(None);
+            };
+            *flags |= 0x80 >> (bit % 8);
         }
     }
     let size = u32::try_from(data.len()).map_err(|_| PstError::IntegerConversion)?;
@@ -1714,31 +1744,58 @@ fn bbt_entry(
 }
 
 /// The leaf data blocks of a data tree, in order, as `(block, size)`.
+///
+/// MailCraft: read the way the reader reads a tree (`DataTree::blocks`): an XBLOCK names leaves
+/// and an XXBLOCK names XBLOCKs, nothing deeper, and leaves are named only until the size the
+/// top block declares is reached. A tree that names itself is an error rather than a stack
+/// overflow, and blocks named over and over can't make the list longer than the tree holds.
 fn data_tree_leaves(
     file: &mut File,
+    encoding: NdbCryptMethod,
     bbt_entries: &[UnicodeBlockBTreeEntry],
     block: UnicodeBlockId,
 ) -> io::Result<Vec<(UnicodeBlockId, u32)>> {
     let entry = bbt_entry(bbt_entries, block)?;
-    match UnicodeDataTree::read(file, NdbCryptMethod::None, &entry)? {
-        DataTree::Leaf(_) => Ok(vec![(block, u32::from(entry.size()))]),
-        DataTree::Intermediate(tree) => {
-            let mut leaves = Vec::new();
-            for child in tree.entries() {
-                leaves.extend(data_tree_leaves(file, bbt_entries, child.block())?);
+    let tree = match UnicodeDataTree::read(file, encoding, &entry)? {
+        DataTree::Leaf(_) => return Ok(vec![(block, u32::from(entry.size()))]),
+        DataTree::Intermediate(tree) => tree,
+    };
+    let mut budget = u64::from(tree.header().total_size());
+    let mut leaves = Vec::new();
+    let mut pending = vec![(tree, 0_usize)];
+    while let Some((tree, next)) = pending.last_mut() {
+        let Some(child) = tree.entries().get(*next).map(|entry| entry.block()) else {
+            pending.pop();
+            continue;
+        };
+        *next += 1;
+        if budget == 0 {
+            break;
+        }
+        let level = tree.header().level();
+        let entry = bbt_entry(bbt_entries, child)?;
+        match UnicodeDataTree::read(file, encoding, &entry)? {
+            DataTree::Leaf(_) if level == 1 => {
+                budget = budget.saturating_sub(u64::from(entry.size()));
+                leaves.push((child, u32::from(entry.size())));
             }
-            Ok(leaves)
+            DataTree::Intermediate(child) if child.header().level() + 1 == level => {
+                pending.push((child, 0_usize));
+            }
+            _ => return Err(NdbError::InvalidInternalBlockLevel(level).into()),
         }
     }
+    Ok(leaves)
 }
 
 fn read_data_block(
     file: &mut File,
+    encoding: NdbCryptMethod,
     bbt_entries: &[UnicodeBlockBTreeEntry],
     block: UnicodeBlockId,
 ) -> io::Result<Vec<u8>> {
     let entry = bbt_entry(bbt_entries, block)?;
-    match UnicodeDataTree::read(file, NdbCryptMethod::None, &entry)? {
+    match UnicodeDataTree::read(file, encoding, &entry)? {
         DataTree::Leaf(block) => Ok(block.data().to_vec()),
         DataTree::Intermediate(_) => Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -1756,6 +1813,7 @@ fn read_data_block(
 #[allow(clippy::too_many_arguments)]
 fn append_table_rows(
     file: &mut File,
+    encoding: NdbCryptMethod,
     bbt_entries: &[UnicodeBlockBTreeEntry],
     table: &dyn TableContext,
     heap_block: UnicodeBlockId,
@@ -1781,8 +1839,7 @@ fn append_table_rows(
     };
     if old_count == 0
         || !in_order
-        || row_size == 0
-        || row_size > MAX_DATA_BLOCK_SIZE
+        || !(8..=MAX_DATA_BLOCK_SIZE).contains(&row_size)
         || context
             .rows()
             .is_none_or(|rows| matches!(rows.id_type(), Ok(NodeIdType::HeapNode)))
@@ -1796,15 +1853,21 @@ fn append_table_rows(
     if index.key_size() != 4 || index.entry_size() != 4 || u32::from(index.root()) == 0 {
         return Ok(None);
     }
-    let heap_leaves = data_tree_leaves(file, bbt_entries, heap_block)?;
-    let mut row_leaves = data_tree_leaves(file, bbt_entries, rows_block)?;
+    let heap_leaves = data_tree_leaves(file, encoding, bbt_entries, heap_block)?;
+    let mut row_leaves = data_tree_leaves(file, encoding, bbt_entries, rows_block)?;
     let rows_per_block = MAX_DATA_BLOCK_SIZE / row_size;
-    let tail_rows = old_count.checked_sub((row_leaves.len() - 1) * rows_per_block);
+    // MailCraft: a row matrix with no blocks, or more than its rows fill, takes the rebuild.
+    let Some((tail_block, _)) = row_leaves.pop() else {
+        return Ok(None);
+    };
+    let tail_rows = row_leaves
+        .len()
+        .checked_mul(rows_per_block)
+        .and_then(|full| old_count.checked_sub(full));
     let Some(tail_rows) = tail_rows.filter(|rows| (1..=rows_per_block).contains(rows)) else {
         return Ok(None);
     };
-    let (tail_block, _) = row_leaves.pop().unwrap();
-    let mut tail = read_data_block(file, bbt_entries, tail_block)?;
+    let mut tail = read_data_block(file, encoding, bbt_entries, tail_block)?;
     if heap_leaves.len() != heap.pages.len() || tail.len() < tail_rows * row_size {
         return Ok(None);
     }
@@ -2360,20 +2423,39 @@ impl<E: Copy + BTreeEntry<Key = u64>> BTreeLayout<E> {
             leaves: Vec::new(),
             inner: Vec::new(),
         };
-        let mut stack = vec![(root, 0_u8)];
-        while let Some((page_ref, depth)) = stack.pop() {
-            if depth > 8 {
-                return Err(PstError::InvalidBTreePage(page_ref.index().index()).into());
+        // MailCraft: each page is a level below the one that names it (the root's level is what
+        // it says) and is named once, as the reader's `RootBTreePage::find_entry` checks, so
+        // pages that name themselves, or one page named over and over, are an error rather than
+        // a walk that never ends.
+        let mut stack = vec![(root, 0_u8, None::<u8>)];
+        let mut seen = HashSet::new();
+        while let Some((page_ref, depth, expected)) = stack.pop() {
+            let invalid = || io::Error::from(PstError::InvalidBTreePage(page_ref.index().index()));
+            if depth > 8 || !seen.insert(page_ref.index().index()) {
+                return Err(invalid());
             }
             match read_page(file, page_ref)? {
-                BTreePageItems::Leaf(entries) => layout.leaves.push((page_ref, entries)),
-                BTreePageItems::Intermediate(level, children) => {
-                    let level = usize::from(level.max(1));
-                    if layout.inner.len() < level {
-                        layout.inner.resize_with(level, Vec::new);
+                BTreePageItems::Leaf(entries) => {
+                    if expected.is_some_and(|level| level != 0) {
+                        return Err(invalid());
                     }
-                    stack.extend(children.iter().rev().map(|(_, child)| (*child, depth + 1)));
-                    layout.inner[level - 1].push((page_ref, children));
+                    layout.leaves.push((page_ref, entries))
+                }
+                BTreePageItems::Intermediate(level, children) => {
+                    if level == 0 || expected.is_some_and(|expected| expected != level) {
+                        return Err(invalid());
+                    }
+                    let index = usize::from(level);
+                    if layout.inner.len() < index {
+                        layout.inner.resize_with(index, Vec::new);
+                    }
+                    stack.extend(
+                        children
+                            .iter()
+                            .rev()
+                            .map(|(_, child)| (*child, depth + 1, Some(level - 1))),
+                    );
+                    layout.inner[index - 1].push((page_ref, children));
                 }
             }
         }
@@ -3540,11 +3622,13 @@ fn internal_block_children(
     let mut block_type = [0];
     file.read_exact(&mut block_type)?;
     Ok(match block_type[0] {
+        // Internal blocks (XBLOCKs, SLBLOCKs, SIBLOCKs) are never encoded (MS-PST 5.1, 5.2).
         0x01 => match UnicodeDataTree::read(file, NdbCryptMethod::None, entry)? {
             DataTree::Intermediate(tree) => {
                 tree.entries().iter().map(|entry| entry.block()).collect()
             }
-            DataTree::Leaf(_) => unreachable!(),
+            // MailCraft: an error rather than `unreachable!` (a leaf's ID is never internal).
+            DataTree::Leaf(_) => return Err(NdbError::InvalidInternalBlockType(0x01).into()),
         },
         0x02 => match UnicodeSubNodeTree::read(file, entry)? {
             SubNodeTree::Intermediate(tree) => {
@@ -3790,8 +3874,9 @@ fn commit_unicode_changes(
         &mut live_pages,
     )?;
     let new_eof = next_offset.eof;
-    let amap_last =
-        AMAP_FIRST_OFFSET + ((new_eof - AMAP_FIRST_OFFSET - 1) / AMAP_DATA_SIZE) * AMAP_DATA_SIZE;
+    // MailCraft: saturating, where an end of file before the first map overflowed.
+    let amap_last = AMAP_FIRST_OFFSET
+        + (new_eof.saturating_sub(AMAP_FIRST_OFFSET + 1) / AMAP_DATA_SIZE) * AMAP_DATA_SIZE;
 
     for page in pages {
         write_btree_page(&mut file, page)?;
@@ -4255,6 +4340,7 @@ fn append_unicode_pst(
             "append only supports unencrypted Unicode PSTs",
         ));
     }
+    let encoding = header.crypt_method();
     let old_root = header.root().clone();
     let old_bbt = read_block_btree(&mut file, *old_root.block_btree())?;
     let old_nbt = read_node_btree(&mut file, *old_root.node_btree())?;
@@ -4478,6 +4564,7 @@ fn append_unicode_pst(
             .map(|entry| entry.block());
         if let Some((heap, rows, count)) = append_table_rows(
             &mut file,
+            encoding,
             &bbt_entries,
             contents_table.as_ref(),
             contents_entry.data(),
@@ -4557,6 +4644,7 @@ fn append_unicode_pst(
             .map(|entry| entry.block());
         let patched = patch_table_row(
             &mut file,
+            encoding,
             &bbt_entries,
             table.as_ref(),
             old_rows,
@@ -6456,7 +6544,12 @@ where
             return Ok(());
         }
 
-        let num_amap_pages = root.file_eof_index().index().into() - AMAP_FIRST_OFFSET;
+        // MailCraft: saturating, so an end of file before the first map is no map, not a panic.
+        let num_amap_pages = root
+            .file_eof_index()
+            .index()
+            .into()
+            .saturating_sub(AMAP_FIRST_OFFSET);
         let num_amap_pages = num_amap_pages.div_ceil(AMAP_DATA_SIZE);
 
         let mut amap_pages: Vec<_> = (0..num_amap_pages)
@@ -6845,31 +6938,7 @@ where
         index: u64,
         amap_pages: &mut [AllocationMapPageInfo<Pst>],
     ) -> io::Result<()> {
-        let index = index - AMAP_FIRST_OFFSET;
-        let amap_index =
-            usize::try_from(index / AMAP_DATA_SIZE).map_err(|_| PstError::IntegerConversion)?;
-        let entry = amap_pages
-            .get_mut(amap_index)
-            .ok_or(PstError::AllocationMapPageNotFound(amap_index))?;
-        entry.free_space -= PAGE_SIZE as u64;
-
-        let bytes = entry.amap_page.map_bits_mut();
-
-        let bit_index = usize::try_from((index % AMAP_DATA_SIZE) / 64)
-            .map_err(|_| PstError::IntegerConversion)?;
-        let byte_index = bit_index / 8;
-        let bit_index = bit_index % 8;
-
-        if bit_index == 0 {
-            bytes[byte_index] = 0xFF;
-        } else {
-            let mask = 0x80_u8 >> bit_index;
-            let mask = mask | (mask - 1);
-            bytes[byte_index] |= mask;
-            bytes[byte_index + 1] |= !mask;
-        }
-
-        Ok(())
+        Self::mark_allocation(index, PAGE_SIZE as u64, amap_pages)
     }
 
     /// Mark a block at the given file offset and size as allocated.
@@ -6878,59 +6947,53 @@ where
         size: u16,
         amap_pages: &mut [AllocationMapPageInfo<Pst>],
     ) -> io::Result<()> {
-        let index = index - AMAP_FIRST_OFFSET;
+        // MailCraft: in u32, where a block size near u16::MAX overflowed.
+        let size = u32::from(size)
+            + u32::from(<<Pst as PstFile>::BlockTrailer as BlockTrailerReadWrite>::SIZE);
+        let size = u64::from(size).next_multiple_of(64);
+        Self::mark_allocation(index, size, amap_pages)
+    }
+
+    /// MailCraft: mark `size` bytes at file offset `index` as allocated, one bit per 64 bytes.
+    /// An offset before the first allocation map, a range that runs past its map, or a map's
+    /// free space going below zero is an error, where each one overflowed or indexed out of
+    /// bounds; a damaged file's B-tree can name any of them.
+    fn mark_allocation(
+        index: u64,
+        size: u64,
+        amap_pages: &mut [AllocationMapPageInfo<Pst>],
+    ) -> io::Result<()> {
+        let index = index
+            .checked_sub(AMAP_FIRST_OFFSET)
+            .ok_or(PstError::InvalidBTreePage(index))?;
         let amap_index =
             usize::try_from(index / AMAP_DATA_SIZE).map_err(|_| PstError::IntegerConversion)?;
         let entry = amap_pages
             .get_mut(amap_index)
             .ok_or(PstError::AllocationMapPageNotFound(amap_index))?;
-        let size = u64::from(block_size(
-            size + <<Pst as PstFile>::BlockTrailer as BlockTrailerReadWrite>::SIZE,
-        ));
-        entry.free_space -= size;
+        entry.free_space = entry
+            .free_space
+            .checked_sub(size)
+            .ok_or(PstError::AllocationMapPageNotFound(amap_index))?;
 
         let bytes = entry.amap_page.map_bits_mut();
-
         let bit_start = usize::try_from((index % AMAP_DATA_SIZE) / 64)
             .map_err(|_| PstError::IntegerConversion)?;
-        let bit_end =
-            bit_start + usize::try_from(size / 64).map_err(|_| PstError::IntegerConversion)?;
-        let byte_start = bit_start / 8;
-        let bit_start = bit_start % 8;
-        let byte_end = bit_end / 8;
-        let bit_end = bit_end % 8;
-
-        if byte_start == byte_end {
-            // The allocation fits in a single byte
-            if bit_end > bit_start {
-                let mask_start = 0x80_u8 >> bit_start;
-                let mask_start = mask_start | (mask_start - 1);
-                let mask_end = 0x80_u8 >> bit_end;
-                let mask_end = !(mask_end | (mask_end - 1));
-                let mask = mask_start & mask_end;
-                bytes[byte_start] |= mask;
-            }
-            return Ok(());
+        let bit_end = usize::try_from(size / 64)
+            .ok()
+            .and_then(|bits| bit_start.checked_add(bits))
+            .ok_or(PstError::IntegerConversion)?;
+        if bit_end > bytes.len() * 8 {
+            return Err(PstError::AllocationMapPageNotFound(amap_index.saturating_add(1)).into());
         }
-
-        let byte_start = if bit_start == 0 {
-            byte_start
-        } else {
-            let mask_start = 0x80_u8 >> bit_start;
-            let mask_start = mask_start | (mask_start - 1);
-            bytes[byte_start] |= mask_start;
-            byte_start + 1
-        };
-
-        if bit_end != 0 {
-            let mask_end = 0x80_u8 >> bit_end;
-            let mask_end = !(mask_end | (mask_end - 1));
-            bytes[byte_end] |= mask_end;
-        };
-
-        if byte_end > byte_start {
-            for byte in bytes[byte_start..byte_end].iter_mut() {
-                *byte = 0xFF;
+        let mut bit = bit_start;
+        while bit < bit_end {
+            if bit % 8 == 0 && bit + 8 <= bit_end {
+                bytes[bit / 8] = 0xFF;
+                bit += 8;
+            } else {
+                bytes[bit / 8] |= 0x80 >> (bit % 8);
+                bit += 1;
             }
         }
 
@@ -7047,4 +7110,191 @@ pub fn open_store(path: impl AsRef<Path>) -> io::Result<Rc<dyn Store>> {
         let pst_file = AnsiPstFile::open(path.as_ref())?;
         AnsiStore::read(Rc::new(pst_file))?
     })
+}
+
+/// MailCraft: the writer reads a file it adds to the way the reader reads one, so a damaged
+/// file is an error rather than a panic, a stack overflow or a walk that never ends.
+#[cfg(test)]
+mod existing_file_tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn scratch_file(label: &str) -> (std::path::PathBuf, File) {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "outlook-pst-{label}-{}-{stamp}.pst",
+            std::process::id()
+        ));
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        (path, file)
+    }
+
+    /// Write `block` at its offset and return its block B-tree entry.
+    fn put(file: &mut File, block: NewBlock) -> UnicodeBlockBTreeEntry {
+        let entry = UnicodeBlockBTreeEntry::new(
+            UnicodeBlockRef::new(block.id, UnicodeByteIndex::new(block.offset)),
+            block.size,
+        );
+        write_new_block(file, block).unwrap();
+        entry
+    }
+
+    fn xblock(
+        id: UnicodeBlockId,
+        offset: u64,
+        children: &[UnicodeBlockId],
+        total: u32,
+    ) -> NewBlock {
+        NewBlock {
+            id,
+            offset,
+            size: u16::try_from(8 + 8 * children.len()).unwrap(),
+            data: NewBlockData::DataTree(
+                children
+                    .iter()
+                    .map(|id| UnicodeDataTreeEntry::from(*id))
+                    .collect(),
+                1,
+                total,
+            ),
+        }
+    }
+
+    #[test]
+    fn a_data_tree_that_names_itself_is_an_error() {
+        let (path, mut file) = scratch_file("xblock-self");
+        let id = UnicodeBlockId::new(true, 2).unwrap();
+        let entry = put(&mut file, xblock(id, 0, &[id], 100));
+        // It used to recurse until the stack overflowed.
+        assert!(data_tree_leaves(&mut file, NdbCryptMethod::None, &[entry], id).is_err());
+        drop(file);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn a_leaf_named_over_and_over_counts_up_to_the_declared_size() {
+        let (path, mut file) = scratch_file("xblock-repeat");
+        let leaf = UnicodeBlockId::new(false, 4).unwrap();
+        let leaf_entry = put(
+            &mut file,
+            NewBlock {
+                id: leaf,
+                offset: 0,
+                size: 100,
+                data: NewBlockData::Data(vec![7; 100]),
+            },
+        );
+        let tree = UnicodeBlockId::new(true, 2).unwrap();
+        let tree_entry = put(&mut file, xblock(tree, 192, &[leaf; 1000], 250));
+        let mut entries = vec![leaf_entry, tree_entry];
+        entries.sort_by_key(BTreeEntry::key);
+        let leaves = data_tree_leaves(&mut file, NdbCryptMethod::None, &entries, tree).unwrap();
+        // 250 bytes declared: three 100-byte blocks reach it, where all 1,000 were listed.
+        assert_eq!(leaves.len(), 3);
+        drop(file);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn a_block_size_no_block_can_have_is_an_error() {
+        let (path, mut file) = scratch_file("block-size");
+        file.write_all(&[0; 16384]).unwrap();
+        let id = UnicodeBlockId::new(false, 4).unwrap();
+        let entry =
+            UnicodeBlockBTreeEntry::new(UnicodeBlockRef::new(id, UnicodeByteIndex::new(0)), 9000);
+        // `block_size` asserted on it.
+        assert!(UnicodeDataTree::read(&mut file, NdbCryptMethod::None, &entry).is_err());
+        assert!(UnicodeSubNodeTree::read(&mut file, &entry).is_err());
+        drop(file);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    fn page(offset: u64) -> UnicodePageRef {
+        UnicodePageRef::new(UnicodePageId::from(offset), UnicodeByteIndex::new(offset))
+    }
+
+    fn btree_with_repeated_leaf(
+        _: &mut File,
+        page_ref: UnicodePageRef,
+    ) -> io::Result<BTreePageItems<UnicodeBlockBTreeEntry>> {
+        Ok(match page_ref.index().index() {
+            // The root names one leaf twice.
+            0x1000 => BTreePageItems::Intermediate(1, vec![(1, page(0x2000)), (2, page(0x2000))]),
+            _ => BTreePageItems::Leaf(Vec::new()),
+        })
+    }
+
+    fn btree_with_a_page_one_level_off(
+        _: &mut File,
+        page_ref: UnicodePageRef,
+    ) -> io::Result<BTreePageItems<UnicodeBlockBTreeEntry>> {
+        // Each page says level 1 and names 500 more pages that say the same.
+        let offset = page_ref.index().index();
+        Ok(BTreePageItems::Intermediate(
+            1,
+            (1..=500).map(|n| (n, page(offset + n * 512))).collect(),
+        ))
+    }
+
+    #[test]
+    fn a_btree_page_named_twice_or_at_its_own_level_is_an_error() {
+        let (path, mut file) = scratch_file("btree-pages");
+        // It used to list the leaf's entries twice.
+        assert!(BTreeLayout::read(&mut file, page(0x1000), btree_with_repeated_leaf).is_err());
+        // It used to read 500^8 pages before its depth limit stopped it.
+        assert!(
+            BTreeLayout::read(&mut file, page(0x1000), btree_with_a_page_one_level_off).is_err()
+        );
+        drop(file);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn a_row_too_short_for_its_id_is_an_error() {
+        let context = TableContextInfo::new(0, 0, 0, 0, HeapId::default(), None, vec![]).unwrap();
+        // It used to panic slicing the row ID into an empty row.
+        assert!(encode_table_row(&context, &mut HeapBuilder::new(), 1_u32, 0, vec![]).is_err());
+    }
+
+    #[test]
+    fn an_allocation_outside_the_maps_is_an_error() {
+        let mut pages = Vec::new();
+        // Before the first map: it used to overflow.
+        assert!(
+            PstFileInner::<UnicodePstFile>::mark_block_allocation(0x200, 64, &mut pages).is_err()
+        );
+        let trailer = <UnicodePageTrailer as PageTrailerReadWrite>::new(
+            PageType::AllocationMap,
+            0,
+            UnicodePageId::from(AMAP_FIRST_OFFSET),
+            0,
+        );
+        pages.push(AllocationMapPageInfo::<UnicodePstFile> {
+            amap_page:
+                <<UnicodePstFile as PstFile>::AllocationMapPage as AllocationMapPageReadWrite<
+                    UnicodePstFile,
+                >>::new([0; mem::size_of::<MapBits>()], trailer)
+                .unwrap(),
+            free_space: AMAP_DATA_SIZE,
+        });
+        // A block that runs past the map's last bit: it used to index out of bounds.
+        let last = AMAP_FIRST_OFFSET + AMAP_DATA_SIZE - 64;
+        assert!(
+            PstFileInner::<UnicodePstFile>::mark_block_allocation(last, 8000, &mut pages).is_err()
+        );
+        assert!(PstFileInner::<UnicodePstFile>::mark_block_allocation(
+            AMAP_FIRST_OFFSET + 512,
+            100,
+            &mut pages
+        )
+        .is_ok());
+    }
 }

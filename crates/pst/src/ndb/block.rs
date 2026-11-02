@@ -614,9 +614,13 @@ where
     {
         f.seek(SeekFrom::Start(block.block().index().index().into()))?;
 
-        let block_size = block_size(
-            block.size() + <<Pst as PstFile>::BlockTrailer as BlockTrailerReadWrite>::SIZE,
-        );
+        // MailCraft: a size the B-tree gives that no block can have is an error; `block_size`
+        // asserts, and the sum overflowed `u16`.
+        let trailer_size = <<Pst as PstFile>::BlockTrailer as BlockTrailerReadWrite>::SIZE;
+        if block.size() > MAX_BLOCK_SIZE - trailer_size {
+            return Err(NdbError::InvalidBlockSize(block.size()).into());
+        }
+        let block_size = block_size(block.size() + trailer_size);
         let mut data = vec![0; block_size as usize];
         f.read_exact(&mut data)?;
         let mut cursor = Cursor::new(data);
@@ -1504,9 +1508,13 @@ where
     ) -> io::Result<Self> {
         f.seek(SeekFrom::Start(block.block().index().index().into()))?;
 
-        let block_size = block_size(
-            block.size() + <<Pst as PstFile>::BlockTrailer as BlockTrailerReadWrite>::SIZE,
-        );
+        // MailCraft: a size the B-tree gives that no block can have is an error; `block_size`
+        // asserts, and the sum overflowed `u16`.
+        let trailer_size = <<Pst as PstFile>::BlockTrailer as BlockTrailerReadWrite>::SIZE;
+        if block.size() > MAX_BLOCK_SIZE - trailer_size {
+            return Err(NdbError::InvalidBlockSize(block.size()).into());
+        }
+        let block_size = block_size(block.size() + trailer_size);
         let mut data = vec![0; block_size as usize];
         f.read_exact(&mut data)?;
         let mut cursor = Cursor::new(data);

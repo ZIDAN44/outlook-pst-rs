@@ -22,7 +22,10 @@ pins its revisions. Drop the fork once a release has all of the fixes.
 
 ## Fixes
 
-Every changed line is marked `MailCraft:` in a comment, with a test beside it.
+Every changed line is marked `MailCraft:` in a comment, with a test beside it. Fixes 1 to 8 are
+the reader's, from `craft/1.2.0` (commits `560024b`, `4832e88`, `33c5231`, `647f6fd`, `38765ba`,
+`b3a2ed1`), cherry-picked with their authors onto the writer's copy of the reader; 9 and 10 are
+the writer's own.
 
 1. **Reads are capped** (`ndb/block.rs`, `ndb/page.rs`, `ndb/read_write.rs`, `ltp/heap.rs`,
    `ltp/prop_context.rs`, `ltp/table_context.rs`, `messaging/message.rs`, `messaging/attachment.rs`,
@@ -69,17 +72,30 @@ Every changed line is marked `MailCraft:` in a comment, with a test beside it.
 7. **`UnicodeAttachment::embedded_message()` and `AnsiAttachment::embedded_message()`** hand back
    the attached message as the file's own message type (kept beside the `Rc<dyn Message>` in
    `AttachmentData::Message`), so its own attachments read with `UnicodeAttachment::read`.
-8. **The root folder's hierarchy table reads** (`messaging/store.rs`): from upstream
-   (microsoft/outlook-pst-rs#55, commit `d0f9f001`, after 1.2.0), cherry-picked with its author,
-   so its lines carry no `MailCraft:` mark; drop it when a release has it.
-   `Store::root_hierarchy_table` held the file's lock while `TableContextReadWrite::read` locked
-   it again, so every call hung for good; the node is now found and the lock let go first.
+8. **The root folder's hierarchy table reads** (`messaging/store.rs`): upstream's fix
+   (microsoft/outlook-pst-rs#55, commit `d0f9f001`) is already in outlook-pst-rw 1.2.14, so
+   only its test comes over from `craft/1.2.0`. `Store::root_hierarchy_table` held the file's
+   lock while `TableContextReadWrite::read` locked it again, so every call hung for good.
    Test: `messaging::store::tests` (fails on its time limit without the fix).
+9. **The writer reads a file it adds to as the reader does** (`lib.rs`, `ltp/heap.rs`,
+   `ndb/block.rs`):
+   - its own walks of a data tree (`data_tree_leaves`, `read_data_block`) read data blocks with
+     the file's `bCryptMethod`, where they read them as if unencoded, take only XBLOCKs over
+     leaves and XXBLOCKs over XBLOCKs, and stop naming leaves at the size the top block
+     declares, like `DataTree::blocks`; a tree that names itself was a stack overflow;
+   - its walk of the node and block B-trees (`BTreeLayout::read`) takes each page a level below
+     the one that names it and each page once, where one page named twice was listed twice and
+     pages that named more pages at their own level were walked 500^8 times;
+   - a block size no block can have (over 8,192 bytes with its trailer) is an error in
+     `DataTree::read` and `SubNodeTree::read`, where `block_size` asserted and the sum
+     overflowed `u16`;
+   - a heap allocation placed past its block is an error (`HeapNode::find_entry`,
+     `writer_pages`), and so are a table row too short for its ID and a column past its row
+     (`encode_table_row`, `patch_table_row`), an allocation map bit before the first map or
+     past its own map (`mark_page_allocation`, `mark_block_allocation`), a row matrix with no
+     blocks (`append_table_rows`) and an end of file before the first map: each one panicked
+     or overflowed;
+   - `internal_block_children` returns an error where it had `unreachable!`, and the row
+     index reads lose their `unwrap`s.
 
-Fixes 1 and 4 to 7 are also proved on whole files in MailCraft's
-`crates/net/src/data_files/pst/tests/reader.rs`: files made with `outlook-pst-rw` and changed
-byte by byte into an attachment that holds a message (found in its own subnode tree, or in the
-message's when its own is damaged), a zero-byte file, a store's and a name-to-id map's value
-over the file's limit, a data tree that says less than it holds, one that names one block over
-and over and one that points at itself, and a node B-tree page that points at itself, each read
-on a thread with a time limit.
+   Tests: `existing_file_tests`, `ltp::heap::tests`.

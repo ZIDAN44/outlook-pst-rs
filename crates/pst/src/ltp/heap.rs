@@ -560,10 +560,11 @@ where
         // MailCraft: a HID names one of at most 2^16 blocks, so a heap that declares more than
         // they can hold is damaged; an error before any of it is read.
         if data_tree.declared_size() > MAX_HEAP_SIZE {
-            return Err(
-                crate::ndb::NdbError::DataTreeTooLarge(data_tree.declared_size(), MAX_HEAP_SIZE)
-                    .into(),
-            );
+            return Err(crate::ndb::NdbError::DataTreeTooLarge(
+                data_tree.declared_size(),
+                MAX_HEAP_SIZE,
+            )
+            .into());
         }
         let data = data_tree
             .blocks(
@@ -609,7 +610,10 @@ where
         let &(start, end) = allocations
             .get(index as usize)
             .ok_or(LtpError::HeapAllocIndexNotFound(index))?;
-        Ok(&block[start..end])
+        // MailCraft: an allocation the page map places past its block is an error, not a panic.
+        block
+            .get(start..end)
+            .ok_or_else(|| LtpError::HeapAllocIndexNotFound(index).into())
     }
 
     fn page_map_ranges(block: &[u8], block_index: u16) -> io::Result<Vec<(usize, usize)>> {
@@ -650,11 +654,17 @@ where
                 cursor.seek(SeekFrom::Start(u64::from(page_map_offset)))?;
                 let page_map = HeapNodePageMap::read(&mut cursor)?;
                 let mut allocations = vec![Vec::new()];
-                allocations.extend(page_map.allocations().iter().map(|allocation| {
+                for allocation in page_map.allocations() {
                     let start = usize::from(allocation.offset());
                     let end = start + usize::from(allocation.size());
-                    data[start..end].to_vec()
-                }));
+                    // MailCraft: an allocation past its block is an error, not a panic.
+                    let data = data
+                        .get(start..end)
+                        .ok_or(LtpError::HeapAllocIndexNotFound(
+                            u16::try_from(allocations.len()).unwrap_or(u16::MAX),
+                        ))?;
+                    allocations.push(data.to_vec());
+                }
                 Ok(allocations)
             })
             .collect()
@@ -720,5 +730,39 @@ impl HeapNodeReadWrite<AnsiPstFile> for AnsiHeapNode {
     ) -> io::Result<Self> {
         let inner = HeapNodeInner::read(f, block_btree, page_cache, encoding, key)?;
         Ok(Self { inner })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// MailCraft: a heap page whose page map places an allocation past the end of its block.
+    fn heap_past_its_block() -> HeapNodeInner<UnicodePstFile> {
+        let mut data = Vec::new();
+        HeapNodeHeader::new(
+            12,
+            HeapNodeType::Table,
+            HeapId::default(),
+            [HeapFillLevel::Empty; 8],
+        )
+        .write(&mut data)
+        .unwrap();
+        for value in [1_u16, 0, 12, 4000] {
+            data.write_u16::<LittleEndian>(value).unwrap();
+        }
+        let block = UnicodeDataBlock::new(NdbCryptMethod::None, data, Default::default()).unwrap();
+        HeapNodeInner {
+            data: vec![block],
+            page_maps: vec![OnceCell::new()],
+        }
+    }
+
+    #[test]
+    fn an_allocation_past_its_block_is_an_error() {
+        let heap = heap_past_its_block();
+        // Both used to panic slicing the block.
+        assert!(heap.find_entry(HeapId::new(1, 0).unwrap()).is_err());
+        assert!(heap.writer_pages().is_err());
     }
 }
