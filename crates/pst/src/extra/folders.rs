@@ -220,6 +220,9 @@ fn find_inbox(store: &Rc<UnicodeStore>, top: NodeId) -> io::Result<Option<NodeId
 
 /// A folder's names from the IPM subtree down to it; `None` when it isn't a folder under it (the
 /// subtree itself isn't), or is deeper than [`MAX_DEPTH`].
+///
+/// MailCraft: each folder is looked through once, so a damaged hierarchy that lists a folder
+/// under itself, or twice, costs one look per folder, not one per path to it.
 fn folder_names(store: &Rc<UnicodeStore>, node: NodeId) -> io::Result<Option<Vec<String>>> {
     let top = store.properties().ipm_sub_tree_entry_id()?.node_id();
     if node == top {
@@ -228,8 +231,9 @@ fn folder_names(store: &Rc<UnicodeStore>, node: NodeId) -> io::Result<Option<Vec
     // Down from the top, as names in the hierarchy tables, so the folder's place is the one
     // the file shows.
     let mut stack = vec![(top, Vec::<String>::new())];
+    let mut seen = HashSet::new();
     while let Some((parent, names)) = stack.pop() {
-        if names.len() >= MAX_DEPTH {
+        if names.len() >= MAX_DEPTH || !seen.insert(u32::from(parent)) {
             continue;
         }
         let Ok(folder) = store.open_folder(&store.properties().make_entry_id(parent)?) else {

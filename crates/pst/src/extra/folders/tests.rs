@@ -265,3 +265,73 @@ fn an_inbox_by_another_name_is_found_by_what_it_records() {
     assert!(inbox.properties().get(0x36D8).is_none());
     std::fs::remove_file(path).unwrap();
 }
+
+/// A damaged hierarchy that lists a folder under itself, twice: looking for a folder that isn't
+/// there looks through each folder once, where it took one look per path (2^64 of them).
+#[test]
+fn a_folder_listed_under_itself_is_looked_through_once() {
+    let path = temp_pst("special-cyclic");
+    drop(
+        UnicodePstFile::create_in_folder(
+            &path,
+            &["A", "B"],
+            &message("First", "<first@example.com>", &[]),
+        )
+        .unwrap(),
+    );
+    drop(UnicodePstFile::create_folder(&path, &["A", "C"], MAIL_CONTAINER_CLASS).unwrap());
+    let (a, b, c) = {
+        let store = open_store(&path);
+        (
+            u32::from(folder(&store, &["A"]).0),
+            u32::from(folder(&store, &["A", "B"]).0),
+            u32::from(folder(&store, &["A", "C"]).0),
+        )
+    };
+    // A's hierarchy table (its row index and its rows, the blocks that name both B and C) made
+    // to name A in their place, the blocks' CRCs made right.
+    let mut f = std::fs::read(&path).unwrap();
+    let mut patched = 0;
+    for end in (64..=f.len()).step_by(64) {
+        let size = usize::from(u16::from_le_bytes([f[end - 16], f[end - 15]]));
+        let Some(start) = end.checked_sub((size + 16).div_ceil(64) * 64) else {
+            continue;
+        };
+        let stored = u32::from_le_bytes(f[end - 12..end - 8].try_into().unwrap());
+        if !(4..=8176).contains(&size)
+            || crate::crc::compute_crc(0, &f[start..start + size]) != stored
+        {
+            continue;
+        }
+        let block = &mut f[start..start + size];
+        let has = |block: &[u8], id: u32| block.windows(4).any(|w| w == id.to_le_bytes());
+        if !has(block, b) || !has(block, c) {
+            continue;
+        }
+        for at in 0..size - 3 {
+            if block[at..at + 4] == b.to_le_bytes() || block[at..at + 4] == c.to_le_bytes() {
+                block[at..at + 4].copy_from_slice(&a.to_le_bytes());
+            }
+        }
+        let crc = crate::crc::compute_crc(0, &f[start..start + size]);
+        f[end - 12..end - 8].copy_from_slice(&crc.to_le_bytes());
+        patched += 1;
+    }
+    assert!(patched > 0);
+    std::fs::write(&path, f).unwrap();
+
+    let store = open_store(&path);
+    let (_, a_folder) = folder(&store, &["A"]);
+    let rows: Vec<u32> = a_folder
+        .hierarchy_table()
+        .unwrap()
+        .rows_matrix()
+        .map(|row| u32::from(row.id()))
+        .collect();
+    assert_eq!(rows, [a, a]);
+    assert_eq!(
+        folder_names(&store, NodeId::from(0x7FFF_FFE2)).unwrap(),
+        None
+    );
+    std::fs::remove_file(path).unwrap();
+}

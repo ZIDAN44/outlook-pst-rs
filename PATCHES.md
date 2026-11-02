@@ -232,3 +232,12 @@ are the writer's own.
     Test: `extra::folders::tests::an_inbox_by_another_name_is_found_by_what_it_records` (Drafts
     and Junk Email recorded on a "Posteingang" that records the Calendar, the values it had kept,
     and not on a folder named Inbox beside it).
+19. **A folder listed under itself is looked through once** (`extra/folders.rs`): `special_folder`
+    finds a folder's names by walking the hierarchy down from the IPM subtree, up to 64 deep, and
+    looked through a folder once per path to it. A damaged hierarchy table that lists a folder
+    under itself twice made that 2^64 looks, so reading a damaged file's special folders never
+    ended. Each folder is now looked through once.
+
+    Test: `extra::folders::tests::a_folder_listed_under_itself_is_looked_through_once` (a folder
+    whose hierarchy table names it twice, in its row index and its rows: looking for a folder that
+    isn't there ends; without the fix it ran on past a minute).
