@@ -337,14 +337,14 @@ impl UnicodePstFile {
     }
 
     /// Set the store display name (PR_DISPLAY_NAME of the message store) of an existing
-    /// unencrypted Unicode PST. Outlook shows it as the top-level name when the file is opened.
+    /// Unicode PST. Outlook shows it as the top-level name when the file is opened.
     pub fn set_store_display_name(path: impl AsRef<Path>, name: &str) -> io::Result<Self> {
         set_unicode_store_display_name(path.as_ref(), name)?;
         Self::open(path)
     }
 
     /// Append one message to the default receive folder (normally Inbox) of an
-    /// existing unencrypted Unicode PST.
+    /// existing Unicode PST, unencoded or permute- or cyclic-encoded.
     pub fn append(path: impl AsRef<Path>, message: &UnicodePstMessage<'_>) -> io::Result<Self> {
         append_unicode_pst(
             path.as_ref(),
@@ -358,7 +358,7 @@ impl UnicodePstFile {
     }
 
     /// Append one message and its by-value attachments to the default receive folder of an
-    /// existing unencrypted Unicode PST.
+    /// existing Unicode PST, unencoded or permute- or cyclic-encoded.
     pub fn append_with_attachments(
         path: impl AsRef<Path>,
         message: &UnicodePstMessage<'_>,
@@ -3028,15 +3028,25 @@ fn push_subnode_tree(
 /// Encodes blocks in memory and sends each run of contiguous blocks to the file in one write.
 /// The block encoders write field by field, and on Windows every one of those small writes is a
 /// costly system call.
-#[derive(Default)]
 struct BlockWriter {
     base: u64,
     position: u64,
     buffer: Vec<u8>,
+    /// MailCraft: the file's `bCryptMethod`, which its data blocks are encoded with.
+    encoding: NdbCryptMethod,
 }
 
 impl BlockWriter {
     const MAX_RUN: usize = 8 << 20;
+
+    fn new(encoding: NdbCryptMethod) -> Self {
+        Self {
+            base: 0,
+            position: 0,
+            buffer: Vec::new(),
+            encoding,
+        }
+    }
 
     fn push(&mut self, file: &mut File, block: NewBlock) -> io::Result<()> {
         let end = self.base + self.buffer.len() as u64;
@@ -3046,7 +3056,8 @@ impl BlockWriter {
         if self.buffer.is_empty() {
             self.base = block.offset;
         }
-        write_new_block(self, block)
+        let encoding = self.encoding;
+        write_new_block(self, encoding, block)
     }
 
     fn flush(&mut self, file: &mut File) -> io::Result<()> {
@@ -3099,14 +3110,19 @@ impl Seek for BlockWriter {
     }
 }
 
-fn write_new_block<W: Write + Seek>(file: &mut W, block: NewBlock) -> io::Result<()> {
+/// Write `block` at its offset. MailCraft: a data block is encoded with `encoding`, the file's
+/// `bCryptMethod` (permute or cyclic, keyed on the block ID); XBLOCKs, XXBLOCKs, SLBLOCKs and
+/// SIBLOCKs are never encoded (MS-PST 5.1, 5.2).
+fn write_new_block<W: Write + Seek>(
+    file: &mut W,
+    encoding: NdbCryptMethod,
+    block: NewBlock,
+) -> io::Result<()> {
     let block_signature = block_sig::compute_sig(block.offset as u32, u64::from(block.id) as u32);
     let trailer = UnicodeBlockTrailer::new(block.size, block_signature, 0, block.id)?;
     file.seek(SeekFrom::Start(block.offset))?;
     match block.data {
-        NewBlockData::Data(data) => {
-            UnicodeDataBlock::new(NdbCryptMethod::None, data, trailer)?.write(file)
-        }
+        NewBlockData::Data(data) => UnicodeDataBlock::new(encoding, data, trailer)?.write(file),
         NewBlockData::DataTree(entries, level, total_size) => {
             let header = DataTreeBlockHeader::new(
                 level,
@@ -3815,7 +3831,7 @@ fn commit_unicode_changes(
     // switch and one after it (the allocation map is invalid until it is rebuilt) suffice.
     header.root_mut().set_amap_status(AmapStatus::Invalid);
     header.update_unique();
-    let mut writer = BlockWriter::default();
+    let mut writer = BlockWriter::new(header.crypt_method());
     for block in blocks {
         writer.push(&mut file, block)?;
     }
@@ -3916,13 +3932,8 @@ fn set_unicode_store_display_name(path: &Path, name: &str) -> io::Result<()> {
         ));
     }
     let mut file = OpenOptions::new().read(true).write(true).open(path)?;
+    // MailCraft: an encoded file is renamed too; its new blocks are encoded like the rest.
     let header = UnicodeHeader::read(&mut file)?;
-    if header.crypt_method() != NdbCryptMethod::None {
-        return Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "store renaming only supports unencrypted Unicode PSTs",
-        ));
-    }
     let old_root = header.root().clone();
     let old_bbt = read_block_btree(&mut file, *old_root.block_btree())?;
     let old_nbt = read_node_btree(&mut file, *old_root.node_btree())?;
@@ -4006,13 +4017,9 @@ fn set_unicode_store_display_name(path: &Path, name: &str) -> io::Result<()> {
 
 fn create_unicode_folder(path: &Path, parent: NodeId, name: &str) -> io::Result<NodeId> {
     let mut file = OpenOptions::new().read(true).write(true).open(path)?;
+    // MailCraft: folders are made in an encoded file too; its new blocks are encoded like the
+    // rest.
     let header = UnicodeHeader::read(&mut file)?;
-    if header.crypt_method() != NdbCryptMethod::None {
-        return Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "folder creation only supports unencrypted Unicode PSTs",
-        ));
-    }
     let old_root = header.root().clone();
     let old_bbt = read_block_btree(&mut file, *old_root.block_btree())?;
     let old_nbt = read_node_btree(&mut file, *old_root.node_btree())?;
@@ -4334,12 +4341,8 @@ fn append_unicode_pst(
         .transpose()?;
     let mut file = OpenOptions::new().read(true).write(true).open(path)?;
     let mut header = UnicodeHeader::read(&mut file)?;
-    if header.crypt_method() != NdbCryptMethod::None {
-        return Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "append only supports unencrypted Unicode PSTs",
-        ));
-    }
+    // MailCraft: a permute- or cyclic-encoded file (Outlook's default is permute) is added to
+    // as well: its blocks are read decoded and new data blocks are written encoded alike.
     let encoding = header.crypt_method();
     let old_root = header.root().clone();
     let old_bbt = read_block_btree(&mut file, *old_root.block_btree())?;
@@ -4467,7 +4470,7 @@ fn append_unicode_pst(
     header.update_unique();
 
     let mut message_entries = Vec::with_capacity(inputs.len());
-    let mut block_writer = BlockWriter::default();
+    let mut block_writer = BlockWriter::new(encoding);
     for (position, ((input, message), message_size)) in
         inputs.iter().zip(&messages).zip(&message_sizes).enumerate()
     {
@@ -6091,7 +6094,8 @@ mod create_tests {
         .unwrap();
 
         // Outlook's fixture uses permute encoding. Decode its data blocks so the same Outlook
-        // structure exercises the writer's intentionally unencrypted-only append path.
+        // structure exercises the writer's unencoded append path (MailCraft: the encoded ones are
+        // `appends_to_permute_and_cyclic_encoded_unicode_psts`).
         let mut file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -6202,6 +6206,174 @@ mod create_tests {
         );
         drop((imported_2026, imported, inbox, store));
         std::fs::remove_file(path).unwrap();
+    }
+
+    /// MailCraft: Outlook's fixture as Outlook made it, permute-encoded, or re-encoded cyclic.
+    fn encoded_outlook_pst(label: &str, method: NdbCryptMethod) -> std::path::PathBuf {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "outlook-pst-{label}-{}-{stamp}.pst",
+            std::process::id()
+        ));
+        std::fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/Empty.pst"),
+            &path,
+        )
+        .unwrap();
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let mut header = UnicodeHeader::read(&mut file).unwrap();
+        assert_eq!(header.crypt_method(), NdbCryptMethod::Permute);
+        if method != NdbCryptMethod::Permute {
+            let entries =
+                collect_block_btree_entries(&mut file, *header.root().block_btree()).unwrap();
+            for entry in entries
+                .iter()
+                .filter(|entry| !entry.block().block().is_internal())
+            {
+                file.seek(SeekFrom::Start(entry.block().index().index()))
+                    .unwrap();
+                let block =
+                    UnicodeDataBlock::read(&mut file, entry.size(), NdbCryptMethod::Permute)
+                        .unwrap();
+                file.seek(SeekFrom::Start(entry.block().index().index()))
+                    .unwrap();
+                UnicodeDataBlock::new(method, block.data().to_vec(), *block.trailer())
+                    .unwrap()
+                    .write(&mut file)
+                    .unwrap();
+            }
+            header.set_crypt_method(method);
+            file.seek(SeekFrom::Start(0)).unwrap();
+            header.write(&mut file).unwrap();
+            file.sync_all().unwrap();
+        }
+        path
+    }
+
+    /// MailCraft: every data block of the file, read raw and decoded with its own method.
+    fn data_blocks(path: &Path) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let mut file = File::open(path).unwrap();
+        let header = UnicodeHeader::read(&mut file).unwrap();
+        let entries = collect_block_btree_entries(&mut file, *header.root().block_btree()).unwrap();
+        entries
+            .iter()
+            .filter(|entry| !entry.block().block().is_internal())
+            .map(|entry| {
+                let mut read = |method| {
+                    file.seek(SeekFrom::Start(entry.block().index().index()))
+                        .unwrap();
+                    UnicodeDataBlock::read(&mut file, entry.size(), method)
+                        .unwrap()
+                        .data()
+                        .to_vec()
+                };
+                (read(NdbCryptMethod::None), read(header.crypt_method()))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn appends_to_permute_and_cyclic_encoded_unicode_psts() {
+        for (label, method) in [
+            ("permute", NdbCryptMethod::Permute),
+            ("cyclic", NdbCryptMethod::Cyclic),
+        ] {
+            let path = encoded_outlook_pst(&format!("encoded-{label}"), method);
+            let body = "encoded body ".repeat(1_500);
+            let attachment_bytes = (0..20_000_u32).map(|n| (n % 251) as u8).collect::<Vec<_>>();
+            let input = UnicodePstMessage {
+                subject: "appended to an encoded PST",
+                sender_name: "sender",
+                sender_email: "sender@example.com",
+                recipients: TEST_RECIPIENTS,
+                body: &body,
+                html_body: Some("<p>encoded</p>"),
+                message_id: "<encoded@example.com>",
+                delivery_time: 133_750_080_000_000_000,
+            };
+            let attachments = [UnicodePstAttachment {
+                filename: "encoded.bin",
+                mime_type: "application/octet-stream",
+                content_id: None,
+                data: &attachment_bytes,
+            }];
+            drop(UnicodePstFile::set_store_display_name(&path, "Encoded").unwrap());
+            drop(UnicodePstFile::append_with_attachments(&path, &input, &attachments).unwrap());
+            // The second batch appends rows in place: the contents table's tail block and the
+            // parent's hierarchy row are read back decoded and rewritten encoded.
+            let batch = (0..40)
+                .map(|_| UnicodePstBatchMessage {
+                    message: input,
+                    attachments: &attachments,
+                })
+                .collect::<Vec<_>>();
+            drop(UnicodePstFile::append_many_with_attachments(&path, &batch).unwrap());
+            drop(UnicodePstFile::append_in_folder(&path, &["Imported", "2026"], &input).unwrap());
+
+            let pst = UnicodePstFile::open(&path).unwrap();
+            assert_eq!(pst.header().crypt_method(), method);
+            let store = UnicodeStore::read(Rc::new(pst)).unwrap();
+            assert_eq!(store.properties().display_name().unwrap(), "Encoded");
+            let mut reader = File::open(&path).unwrap();
+            let nbt_root = *UnicodeHeader::read(&mut reader)
+                .unwrap()
+                .root()
+                .node_btree();
+            let nbt_entries = collect_node_btree_entries(&mut reader, nbt_root).unwrap();
+            let inbox_id = default_receive_folder(&store, &nbt_entries).unwrap();
+            let inbox = store
+                .open_folder(&store.properties().make_entry_id(inbox_id).unwrap())
+                .unwrap();
+            assert_eq!(inbox.properties().content_count().unwrap(), 41);
+            let message_ids = inbox
+                .contents_table()
+                .unwrap()
+                .rows_matrix()
+                .map(|row| NodeId::from(u32::from(row.id())))
+                .collect::<Vec<_>>();
+            assert_eq!(message_ids.len(), 41);
+            for message_id in [message_ids[0], message_ids[40]] {
+                let entry_id = store.properties().make_entry_id(message_id).unwrap();
+                let message = UnicodeMessage::read(store.clone(), &entry_id, None).unwrap();
+                match message.properties().get(0x1000).unwrap() {
+                    PropertyValue::Unicode(value) => assert_eq!(value.to_string(), body),
+                    value => panic!("unexpected body value: {value:?}"),
+                }
+                let attachment_id = NodeId::from(u32::from(
+                    message
+                        .attachment_table()
+                        .unwrap()
+                        .rows_matrix()
+                        .next()
+                        .unwrap()
+                        .id(),
+                ));
+                let attachment = UnicodeAttachment::read(message, attachment_id, None).unwrap();
+                match attachment.data().unwrap() {
+                    AttachmentData::Binary(value) => assert_eq!(value.buffer(), attachment_bytes),
+                    AttachmentData::Message(_) => panic!("unexpected embedded message"),
+                }
+            }
+            let imported_2026 = folder_at_path(&store, &["Imported", "2026"]);
+            assert_eq!(imported_2026.properties().content_count().unwrap(), 1);
+            drop((imported_2026, inbox, store));
+
+            // Every data block, old and new, is encoded: the body's text never shows raw.
+            let blocks = data_blocks(&path);
+            let needle = utf16_bytes("encoded body");
+            let needle = &needle[..needle.len() - 2];
+            let contains = |data: &[u8]| data.windows(needle.len()).any(|window| window == needle);
+            assert!(blocks.iter().any(|(_, decoded)| contains(decoded)));
+            assert!(blocks.iter().all(|(raw, _)| !contains(raw)));
+            std::fs::remove_file(path).unwrap();
+        }
     }
 
     #[test]
@@ -7143,7 +7315,7 @@ mod existing_file_tests {
             UnicodeBlockRef::new(block.id, UnicodeByteIndex::new(block.offset)),
             block.size,
         );
-        write_new_block(file, block).unwrap();
+        write_new_block(file, NdbCryptMethod::None, block).unwrap();
         entry
     }
 

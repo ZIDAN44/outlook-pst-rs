@@ -99,3 +99,16 @@ the writer's own.
      index reads lose their `unwrap`s.
 
    Tests: `existing_file_tests`, `ltp::heap::tests`.
+10. **A permute- or cyclic-encoded file is added to** (`lib.rs`): files Outlook makes are
+    permute-encoded (`bCryptMethod` 0x01) by default, and `append*`, `create_*_in_folder` and
+    `set_store_display_name` refused every file that wasn't unencoded. Their new data blocks
+    are now written encoded with the file's method (`BlockWriter`, `write_new_block`; cyclic
+    is keyed on each block's ID), and only data blocks: XBLOCKs, XXBLOCKs, SLBLOCKs and
+    SIBLOCKs never are (MS-PST 5.1, 5.2). Existing blocks are read decoded (fix 9). Files the
+    writer creates stay unencoded.
+
+    Test: `create_tests::appends_to_permute_and_cyclic_encoded_unicode_psts` adds to Outlook's
+    own fixture as Outlook made it (permute) and re-encoded cyclic: a renamed store, a message
+    with an 8 KB+ body and a 20,000-byte attachment, a batch of 40 that appends the contents
+    table's rows in place, and a new nested folder, all read back with the crate's reader; no
+    data block's raw bytes show the body's text.
