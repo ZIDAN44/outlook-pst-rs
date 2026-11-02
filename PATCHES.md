@@ -24,7 +24,7 @@ pins its revisions. Drop the fork once a release has all of the fixes.
 
 Every changed line is marked `MailCraft:` in a comment, with a test beside it. Fixes 1 to 8 are
 the reader's, from `craft/1.2.0` (commits `560024b`, `4832e88`, `33c5231`, `647f6fd`, `38765ba`,
-`b3a2ed1`), cherry-picked with their authors onto the writer's copy of the reader; 9 to 11 are
+`b3a2ed1`), cherry-picked with their authors onto the writer's copy of the reader; 9 to 12 are
 the writer's own.
 
 1. **Reads are capped** (`ndb/block.rs`, `ndb/page.rs`, `ndb/read_write.rs`, `ltp/heap.rs`,
@@ -78,7 +78,7 @@ the writer's own.
    lock while `TableContextReadWrite::read` locked it again, so every call hung for good.
    Test: `messaging::store::tests` (fails on its time limit without the fix).
 9. **The writer reads a file it adds to as the reader does** (`lib.rs`, `ltp/heap.rs`,
-   `ndb/block.rs`):
+   `ndb/block.rs`; with the reader's limit in force since fix 12):
    - its own walks of a data tree (`data_tree_leaves`, `read_data_block`) read data blocks with
      the file's `bCryptMethod`, where they read them as if unencoded, take only XBLOCKs over
      leaves and XXBLOCKs over XBLOCKs, and stop naming leaves at the size the top block
@@ -125,3 +125,14 @@ the writer's own.
     Test: `create_tests::a_damaged_allocation_map_is_not_trusted` (Outlook's fixture after 60
     appends, its last map page marking live blocks free with a matching or a stale CRC; every
     message still reads after one more append).
+12. **A file the writer adds to is read within a limit** (`lib.rs`, `open_to_add`): the writer
+    reads the file it adds to through the reader's capped paths (fix 1), but the limit was
+    `u64::MAX` and nothing set it, so a damaged file could still have it build a value, a
+    table's rows or a column kept in a subnode of whatever size the file declared, up to 4 GiB
+    from a few KB of blocks named over and over. `append*`, `create_*_in_folder` and
+    `set_store_display_name` now open it with `ADD_MAX_VALUE_SIZE` (256 MB, MailCraft's own
+    limit) set; anything declared bigger is an error before any of it is read.
+
+    Test: `create_tests::a_file_added_to_is_read_within_the_limit` (with the limit lowered on
+    the test's thread, an append to a folder whose tables hold more is an error and leaves the
+    file as it was).

@@ -3314,12 +3314,37 @@ fn push_attachments(
     Ok(())
 }
 
+/// MailCraft: the most the writer reads of one value, a table's rows or a column kept in a
+/// subnode when it opens a file to add to it (`UnicodePstFile::set_max_value_size`). A damaged
+/// file's tree of blocks named over and over can declare up to 4 GiB from a few KB on disk.
+pub const ADD_MAX_VALUE_SIZE: u64 = 256 * 1024 * 1024;
+
+#[cfg(test)]
+thread_local! {
+    /// A lower limit for the test running on this thread.
+    static TEST_ADD_MAX_VALUE_SIZE: std::cell::Cell<Option<u64>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// MailCraft: every file the writer reads to add to it is opened here, with the limit set.
+fn open_to_add(path: &Path) -> io::Result<UnicodePstFile> {
+    let pst = UnicodePstFile::open(path)?;
+    #[cfg(test)]
+    let limit = TEST_ADD_MAX_VALUE_SIZE
+        .with(std::cell::Cell::get)
+        .unwrap_or(ADD_MAX_VALUE_SIZE);
+    #[cfg(not(test))]
+    let limit = ADD_MAX_VALUE_SIZE;
+    pst.set_max_value_size(limit);
+    Ok(pst)
+}
+
 fn finish_unicode_pst_metadata(
     path: &Path,
     blocks: &[(u64, u16)],
     pages: &[u64],
 ) -> io::Result<()> {
-    let mut pst = UnicodePstFile::open(path)?;
+    let mut pst = open_to_add(path)?;
     pst.inner
         .rebuild_allocation_map_from(Some((blocks, pages)))?;
     pst.inner.ensure_density_list()?;
@@ -4017,7 +4042,7 @@ fn set_unicode_store_display_name(path: &Path, name: &str) -> io::Result<()> {
         .find(|entry| entry.node() == NID_MESSAGE_STORE)
         .copied()
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "message store node not found"))?;
-    let store = UnicodeStore::read(Rc::new(UnicodePstFile::open(path)?))?;
+    let store = UnicodeStore::read(Rc::new(open_to_add(path)?))?;
     let mut properties: Vec<_> = store
         .properties()
         .iter()
@@ -4098,7 +4123,7 @@ fn create_unicode_folder(path: &Path, parent: NodeId, name: &str) -> io::Result<
     let old_nbt = read_node_btree(&mut file, *old_root.node_btree())?;
     let bbt_entries = old_bbt.entries();
     let mut nbt_entries = old_nbt.entries();
-    let pst = Rc::new(UnicodePstFile::open(path)?);
+    let pst = Rc::new(open_to_add(path)?);
     let store = UnicodeStore::read(pst)?;
     let store_record_key = *store.properties().record_key()?.record_key();
     let parent_folder = store.open_folder(&store.properties().make_entry_id(parent)?)?;
@@ -4383,7 +4408,7 @@ fn create_unicode_folder(path: &Path, parent: NodeId, name: &str) -> io::Result<
 
 fn ensure_unicode_folder_path(path: &Path, folder_path: &[&str]) -> io::Result<NodeId> {
     validate_folder_path(folder_path)?;
-    let pst = Rc::new(UnicodePstFile::open(path)?);
+    let pst = Rc::new(open_to_add(path)?);
     let mut store = UnicodeStore::read(pst)?;
     let mut parent = store.properties().ipm_sub_tree_entry_id()?.node_id();
     for name in folder_path {
@@ -4393,7 +4418,7 @@ fn ensure_unicode_folder_path(path: &Path, folder_path: &[&str]) -> io::Result<N
         }
         // ponytail: one COW commit per missing segment; batch only if deep imports need it.
         parent = create_unicode_folder(path, parent, name)?;
-        store = UnicodeStore::read(Rc::new(UnicodePstFile::open(path)?))?;
+        store = UnicodeStore::read(Rc::new(open_to_add(path)?))?;
     }
     Ok(parent)
 }
@@ -4423,7 +4448,7 @@ fn append_unicode_pst(
     let mut bbt_entries = old_bbt.entries();
     let mut nbt_entries = old_nbt.entries();
 
-    let pst = Rc::new(UnicodePstFile::open(path)?);
+    let pst = Rc::new(open_to_add(path)?);
     let store = UnicodeStore::read(pst)
         .map_err(|err| io::Error::new(err.kind(), format!("read message store: {err}")))?;
     let store_record_key = *store
@@ -6538,6 +6563,45 @@ mod create_tests {
             );
             std::fs::remove_file(path).unwrap();
         }
+    }
+
+    #[test]
+    fn a_file_added_to_is_read_within_the_limit() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "outlook-pst-add-limit-{}-{stamp}.pst",
+            std::process::id()
+        ));
+        let body = "row".repeat(10);
+        let message = UnicodePstMessage {
+            subject: "a row of the contents table",
+            sender_name: "sender",
+            sender_email: "sender@example.com",
+            recipients: TEST_RECIPIENTS,
+            body: &body,
+            html_body: None,
+            message_id: "<row@example.com>",
+            delivery_time: 133_750_080_000_000_000,
+        };
+        drop(UnicodePstFile::create_in_folder(&path, &["Rows"], &message).unwrap());
+        drop(UnicodePstFile::append_many_in_folder(&path, &["Rows"], &[message; 300]).unwrap());
+        let before = std::fs::read(&path).unwrap();
+
+        // Below what the folder's tables hold, the append is an error and the file is as it
+        // was; the writer used to read whatever size the file declared, up to 4 GiB.
+        TEST_ADD_MAX_VALUE_SIZE.with(|limit| limit.set(Some(4096)));
+        assert!(UnicodePstFile::append_in_folder(&path, &["Rows"], &message).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        TEST_ADD_MAX_VALUE_SIZE.with(|limit| limit.set(None));
+        drop(UnicodePstFile::append_in_folder(&path, &["Rows"], &message).unwrap());
+        let store = UnicodeStore::read(Rc::new(UnicodePstFile::open(&path).unwrap())).unwrap();
+        let rows = folder_at_path(&store, &["Rows"]);
+        assert_eq!(rows.properties().content_count().unwrap(), 302);
+        drop((rows, store));
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
