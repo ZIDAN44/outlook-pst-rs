@@ -2769,26 +2769,51 @@ impl From<u64> for FileSpace {
 }
 
 impl FileSpace {
-    fn read(file: &mut File, root: &UnicodeRoot) -> io::Result<Self> {
-        let mut space = Self::from(root.file_eof_index().index());
+    /// MailCraft: the allocation map is taken only when every page of it reads as the reader
+    /// reads a map page (type, its repeat and CRC, a zero signature and the page's own offset as
+    /// its ID) and none of the space it marks free holds a block the block B-tree lists, a page
+    /// of either B-tree or a map page. Otherwise the map is treated as invalid and new blocks go
+    /// at the end of the file. A damaged map that still claimed to be valid put new blocks over
+    /// live ones, and the append succeeded with old mail lost.
+    fn read(
+        file: &mut File,
+        root: &UnicodeRoot,
+        bbt: &BTreeLayout<UnicodeBlockBTreeEntry>,
+        nbt: &BTreeLayout<UnicodeNodeBTreeEntry>,
+    ) -> io::Result<Self> {
+        let eof = root.file_eof_index().index();
         if root.amap_is_valid() == AmapStatus::Invalid {
-            return Ok(space);
+            return Ok(Self::from(eof));
         }
-        let mut page = [0; PAGE_SIZE];
+        Ok(Self::read_map(file, eof)
+            .filter(|space| !space.overlaps_live(bbt, nbt))
+            .unwrap_or_else(|| Self::from(eof)))
+    }
+
+    /// The free space the allocation map marks, or `None` if a page of it doesn't read.
+    fn read_map(file: &mut File, eof: u64) -> Option<Self> {
+        let mut space = Self::from(eof);
         let mut amap = AMAP_FIRST_OFFSET;
+        let mut bytes = [0; PAGE_SIZE];
         while amap < space.eof {
-            file.seek(SeekFrom::Start(amap))?;
-            file.read_exact(&mut page)?;
-            let bits = size_of::<MapBits>();
-            if page[bits] != PageType::AllocationMap as u8 {
-                return Ok(Self::from(space.eof));
+            file.seek(SeekFrom::Start(amap)).ok()?;
+            file.read_exact(&mut bytes).ok()?;
+            let page =
+                <<UnicodePstFile as PstFile>::AllocationMapPage as AllocationMapPageReadWrite<
+                    UnicodePstFile,
+                >>::read(&mut &bytes[..])
+                .ok()?;
+            let trailer = page.trailer();
+            if trailer.signature() != 0 || u64::from(trailer.block_id()) != amap {
+                return None;
             }
-            for bit in 0..bits * 8 {
+            let bits = page.map_bits();
+            for bit in 0..bits.len() * 8 {
                 let offset = amap + bit as u64 * 64;
                 if offset >= space.eof {
                     break;
                 }
-                if page[bit / 8] & (0x80 >> (bit % 8)) != 0 {
+                if bits[bit / 8] & (0x80 >> (bit % 8)) != 0 {
                     continue;
                 }
                 match space.free.last_mut() {
@@ -2796,9 +2821,57 @@ impl FileSpace {
                     _ => space.free.push((offset, offset + 64)),
                 }
             }
-            amap += AMAP_DATA_SIZE;
+            amap = amap.checked_add(AMAP_DATA_SIZE)?;
         }
-        Ok(space)
+        Some(space)
+    }
+
+    /// Whether any free range holds a live block, B-tree page or map page.
+    fn overlaps_live(
+        &self,
+        bbt: &BTreeLayout<UnicodeBlockBTreeEntry>,
+        nbt: &BTreeLayout<UnicodeNodeBTreeEntry>,
+    ) -> bool {
+        // The free list is sorted and its ranges don't overlap.
+        let is_free = |start: u64, end: u64| {
+            let index = self
+                .free
+                .partition_point(|&(_, free_end)| free_end <= start);
+            self.free
+                .get(index)
+                .is_some_and(|&(free_start, _)| free_start < end)
+        };
+        let trailer = u64::from(UnicodeBlockTrailer::SIZE);
+        let blocks = bbt
+            .leaves
+            .iter()
+            .flat_map(|(_, entries)| entries)
+            .any(|entry| {
+                let start = entry.block().index().index();
+                let size = (u64::from(entry.size()) + trailer).div_ceil(64) * 64;
+                is_free(start, start.saturating_add(size))
+            });
+        let page = PAGE_SIZE as u64;
+        let pages = bbt
+            .leaves
+            .iter()
+            .map(|(page_ref, _)| page_ref)
+            .chain(bbt.inner.iter().flatten().map(|(page_ref, _)| page_ref))
+            .chain(nbt.leaves.iter().map(|(page_ref, _)| page_ref))
+            .chain(nbt.inner.iter().flatten().map(|(page_ref, _)| page_ref))
+            .any(|page_ref| {
+                let start = page_ref.index().index();
+                is_free(start, start.saturating_add(page))
+            });
+        let map_count = self
+            .eof
+            .saturating_sub(AMAP_FIRST_OFFSET)
+            .div_ceil(AMAP_DATA_SIZE);
+        let maps = (0..map_count).any(|amap_index| {
+            let start = AMAP_FIRST_OFFSET + amap_index * AMAP_DATA_SIZE;
+            is_free(start, start + map_page_count(amap_index) * page)
+        });
+        blocks || pages || maps
     }
 }
 
@@ -3964,7 +4037,7 @@ fn set_unicode_store_display_name(path: &Path, name: &str) -> io::Result<()> {
             .unwrap_or(0)
             .saturating_add(1),
     );
-    let mut next_offset = FileSpace::read(&mut file, &old_root)?;
+    let mut next_offset = FileSpace::read(&mut file, &old_root, &old_bbt, &old_nbt)?;
     let mut blocks = Vec::new();
     let mut subnodes =
         collect_subnode_entries(&mut file, *old_root.block_btree(), store_entry.sub_node())?;
@@ -4101,7 +4174,7 @@ fn create_unicode_folder(path: &Path, parent: NodeId, name: &str) -> io::Result<
             .unwrap_or(0)
             .saturating_add(1),
     );
-    let mut next_offset = FileSpace::read(&mut file, &old_root)?;
+    let mut next_offset = FileSpace::read(&mut file, &old_root, &old_bbt, &old_nbt)?;
     let mut blocks = Vec::new();
 
     let (hierarchy_data_bid, hierarchy_subnode_bid) =
@@ -4466,7 +4539,7 @@ fn append_unicode_pst(
             .unwrap_or(0)
             .saturating_add(1),
     );
-    let mut next_offset = FileSpace::read(&mut file, &old_root)?;
+    let mut next_offset = FileSpace::read(&mut file, &old_root, &old_bbt, &old_nbt)?;
     header.update_unique();
 
     let mut message_entries = Vec::with_capacity(inputs.len());
@@ -6372,6 +6445,97 @@ mod create_tests {
             let contains = |data: &[u8]| data.windows(needle.len()).any(|window| window == needle);
             assert!(blocks.iter().any(|(_, decoded)| contains(decoded)));
             assert!(blocks.iter().all(|(raw, _)| !contains(raw)));
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+
+    /// MailCraft: the bodies of `folder`'s messages that read back as `body`, and how many
+    /// messages it lists.
+    fn bodies_that_read(path: &Path, folder: &[&str], body: &str) -> (usize, usize) {
+        let store = UnicodeStore::read(Rc::new(UnicodePstFile::open(path).unwrap())).unwrap();
+        let folder = folder_at_path(&store, folder);
+        let ids = folder
+            .contents_table()
+            .unwrap()
+            .rows_matrix()
+            .map(|row| NodeId::from(u32::from(row.id())))
+            .collect::<Vec<_>>();
+        let good = ids
+            .iter()
+            .filter(|id| {
+                let Ok(entry_id) = store.properties().make_entry_id(**id) else {
+                    return false;
+                };
+                let Ok(message) = store.open_message(&entry_id, None) else {
+                    return false;
+                };
+                matches!(message.properties().get(0x1000),
+                    Some(PropertyValue::Unicode(value)) if value.to_string() == body)
+            })
+            .count();
+        (good, ids.len())
+    }
+
+    /// MailCraft: the space a file's allocation map marks free, as an append takes it.
+    fn free_space(path: &Path) -> Vec<(u64, u64)> {
+        let mut file = File::open(path).unwrap();
+        let header = UnicodeHeader::read(&mut file).unwrap();
+        let root = header.root();
+        let bbt = read_block_btree(&mut file, *root.block_btree()).unwrap();
+        let nbt = read_node_btree(&mut file, *root.node_btree()).unwrap();
+        FileSpace::read(&mut file, root, &bbt, &nbt).unwrap().free
+    }
+
+    #[test]
+    fn a_damaged_allocation_map_is_not_trusted() {
+        let message = |body| UnicodePstMessage {
+            subject: "kept",
+            sender_name: "sender",
+            sender_email: "sender@example.com",
+            recipients: &[],
+            body,
+            html_body: None,
+            message_id: "<kept@example.com>",
+            delivery_time: 133_750_080_000_000_000,
+        };
+        let body = "a body that must survive ".repeat(200);
+        for (label, fix_crc) in [("amap-crc", true), ("amap-stale", false)] {
+            // Outlook's own file, with commits enough to free space the map then offers.
+            let path = encoded_outlook_pst(label, NdbCryptMethod::Permute);
+            for _ in 0..60 {
+                drop(UnicodePstFile::append_in_folder(&path, &["Kept"], &message(&body)).unwrap());
+            }
+            assert_eq!(bodies_that_read(&path, &["Kept"], &body), (60, 60));
+            assert!(
+                !free_space(&path).is_empty(),
+                "a sound map's free space is used"
+            );
+
+            // The last map page now marks live blocks free; its CRC is either made to match
+            // (the map is wrong but reads) or left stale (the page doesn't read).
+            let mut bytes = std::fs::read(&path).unwrap();
+            let mut reader = Cursor::new(&bytes);
+            let header = UnicodeHeader::read(&mut reader).unwrap();
+            let amap = usize::try_from(header.root().amap_last_index().index()).unwrap();
+            for byte in &mut bytes[amap..amap + 340] {
+                *byte = 0;
+            }
+            if fix_crc {
+                let crc = crate::crc::compute_crc(0, &bytes[amap..amap + 496]);
+                bytes[amap + 500..amap + 504].copy_from_slice(&crc.to_le_bytes());
+            }
+            std::fs::write(&path, &bytes).unwrap();
+            assert!(free_space(&path).is_empty(), "{label}");
+
+            // New blocks used to go over old ones: as the bits fell, the append succeeded with
+            // old messages, or the new one, no longer reading, or failed once the header had
+            // switched to the new trees.
+            drop(UnicodePstFile::append_in_folder(&path, &["Kept"], &message(&body)).unwrap());
+            assert_eq!(
+                bodies_that_read(&path, &["Kept"], &body),
+                (61, 61),
+                "{label}"
+            );
             std::fs::remove_file(path).unwrap();
         }
     }

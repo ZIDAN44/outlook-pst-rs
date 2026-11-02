@@ -24,7 +24,7 @@ pins its revisions. Drop the fork once a release has all of the fixes.
 
 Every changed line is marked `MailCraft:` in a comment, with a test beside it. Fixes 1 to 8 are
 the reader's, from `craft/1.2.0` (commits `560024b`, `4832e88`, `33c5231`, `647f6fd`, `38765ba`,
-`b3a2ed1`), cherry-picked with their authors onto the writer's copy of the reader; 9 and 10 are
+`b3a2ed1`), cherry-picked with their authors onto the writer's copy of the reader; 9 to 11 are
 the writer's own.
 
 1. **Reads are capped** (`ndb/block.rs`, `ndb/page.rs`, `ndb/read_write.rs`, `ltp/heap.rs`,
@@ -112,3 +112,16 @@ the writer's own.
     with an 8 KB+ body and a 20,000-byte attachment, a batch of 40 that appends the contents
     table's rows in place, and a new nested folder, all read back with the crate's reader; no
     data block's raw bytes show the body's text.
+11. **A damaged allocation map is not trusted** (`lib.rs`, `FileSpace::read`): new blocks and
+    pages go where the file's allocation map marks space free, and the map was taken whenever
+    the header called it valid, checking only each page's type byte. A map page now has to read
+    as the reader reads one (type and its repeat, CRC, a zero signature, its own offset as its
+    ID), and no space it marks free may hold a block the block B-tree lists, a page of either
+    B-tree or a map page; otherwise the map is treated as invalid and new blocks go at the end
+    of the file. A map with live blocks marked free put new blocks over them: the append
+    succeeded and old mail no longer read. Outlook's own maps still pass, so their free space
+    is still reused.
+
+    Test: `create_tests::a_damaged_allocation_map_is_not_trusted` (Outlook's fixture after 60
+    appends, its last map page marking live blocks free with a matching or a stale CRC; every
+    message still reads after one more append).
