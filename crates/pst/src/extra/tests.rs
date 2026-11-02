@@ -121,6 +121,7 @@ fn a_message_keeps_its_class_and_added_properties() {
         mime_type: "text/plain",
         content_id: None,
         data: b"data",
+        ..Default::default()
     };
     drop(
         UnicodePstFile::append_with_attachments(

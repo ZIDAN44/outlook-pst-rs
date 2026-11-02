@@ -185,3 +185,27 @@ are the writer's own.
 
     Tests: `extra::folders::tests` (Outlook's empty file records Deleted Items, and keeps it and
     the other `PidTagAdditionalRenEntryIds` values when Junk Email is recorded).
+
+16. **Attached messages, and an attachment's own properties** (`extra/attach.rs`, `extra/named.rs`,
+    `lib.rs`): every attachment was a file (`afByValue`). An attachment's `content` can now be
+    `UnicodePstAttachmentContent::Message`, a message with its own attachments, written as
+    Outlook keeps one (MS-OXCMSG 2.2.2.9, MS-PST 2.4.6.2): `PidTagAttachMethod` 5,
+    `PidTagAttachDataObject` a `PtypObject` naming the message's node and its size, the message
+    (its property context, recipient table 0x692, attachment table 0x671, attachments and values
+    kept in subnodes) in the attachment's own subnode tree under that node, and its subject as
+    the attachment's `PidTagDisplayName`; the attachment table's row has method 5 and no file
+    name. Like Outlook, each attached message's node has a message ID no other node in the file
+    has (`NID_TYPE_NORMAL_MESSAGE`, after the batch's own messages), and the file's next message
+    ID is moved past them. Attached messages nest up to `MAX_EMBEDDED_DEPTH` (32); their classes,
+    tagged and named properties are written as a message's (their names added to the file's map
+    with the batch's). An attachment's `properties` are tagged properties of its own
+    (`PidTagAttachmentHidden` 0x7FFE, `PidTagAttachmentFlags` 0x7FFD…) in place of the writer's
+    of the same ID. Nesting past the limit, bytes given beside a message, an added property that
+    is named, the writer's own (size, value, method), given twice or too big for the
+    attachment's one heap page is an `InvalidInput` error before the file is touched, and so is
+    an attachment whose property context is bigger than a block, which was written as a block
+    no reader takes.
+
+    Tests: `extra::attach::tests` (a message attached three deep with a file at the bottom,
+    beside a file with properties of its own, read back with `UnicodeAttachment::embedded_message`;
+    as deep as the limit and one past it).

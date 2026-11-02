@@ -30,8 +30,8 @@ mod extra;
 
 use extra::*;
 pub use extra::{
-    UnicodePstName, UnicodePstProperty, UnicodePstPropertyKey, UnicodePstSpecialFolder,
-    UnicodePstValue,
+    UnicodePstAttachmentContent, UnicodePstEmbeddedMessage, UnicodePstName, UnicodePstProperty,
+    UnicodePstPropertyKey, UnicodePstSpecialFolder, UnicodePstValue, MAX_EMBEDDED_DEPTH,
 };
 
 use ltp::{
@@ -282,6 +282,7 @@ pub struct UnicodePstMessage<'a> {
 }
 
 /// A by-value file attachment for the Unicode PST writer.
+#[derive(Default)]
 pub struct UnicodePstAttachment<'a> {
     /// File name shown by mail clients.
     pub filename: &'a str,
@@ -292,6 +293,11 @@ pub struct UnicodePstAttachment<'a> {
     pub content_id: Option<&'a str>,
     /// Exact attachment bytes.
     pub data: &'a [u8],
+    /// MailCraft: what the attachment holds when it isn't `data`: an attached message.
+    pub content: UnicodePstAttachmentContent<'a>,
+    /// MailCraft: tagged properties of the attachment's own, in place of the writer's of the
+    /// same ID (not its size, value or method).
+    pub properties: &'a [UnicodePstProperty<'a>],
 }
 
 /// One message and its attachments for a bulk append operation.
@@ -1445,6 +1451,21 @@ fn message_size(
     message: NodeId,
     row_version: u32,
 ) -> io::Result<i32> {
+    let size = message_bytes(input, attachments, named, message, row_version)?;
+    // Outlook excludes the six-byte HN client/root header from message-owned payloads.
+    i32::try_from(size.checked_sub(6).ok_or(PstError::IntegerConversion)?)
+        .map_err(|_| PstError::IntegerConversion.into())
+}
+
+/// MailCraft: the bytes a message's nodes hold, what its attachments hold counted in: a file's
+/// bytes, or an attached message's own nodes alike.
+fn message_bytes(
+    input: &UnicodePstMessage<'_>,
+    attachments: &[UnicodePstAttachment<'_>],
+    named: &NamedIds,
+    message: NodeId,
+    row_version: u32,
+) -> io::Result<usize> {
     let (message_pages, external) =
         message_data(input, attachments, named, message, row_version, 0)?;
     let (recipient_pages, recipient_rows) = recipient_table_data(input.recipients, row_version)?;
@@ -1454,8 +1475,9 @@ fn message_size(
             Ok::<_, io::Error>(NodeId::new(NodeIdType::Attachment, 0x100 + index)?)
         })
         .collect::<io::Result<Vec<_>>>()?;
+    let contents = attachment_contents(attachments, named, row_version)?;
     let (attachment_pages, attachment_rows) =
-        attachment_table_data(&attachment_ids, attachments, row_version)?;
+        attachment_table_data(&attachment_ids, attachments, &contents, row_version)?;
 
     let mut size = message_pages
         .iter()
@@ -1471,20 +1493,45 @@ fn message_size(
             .try_fold(size, |size, data| size.checked_add(data.len()))
             .ok_or(PstError::IntegerConversion)?;
     }
-    for (index, attachment) in attachments.iter().enumerate() {
+    for (index, (attachment, content)) in attachments.iter().zip(&contents).enumerate() {
         let index = u32::try_from(index).map_err(|_| PstError::IntegerConversion)?;
-        let data_node = (!attachment.data.is_empty())
-            .then(|| NodeId::new(NodeIdType::Internal, 0x200 + index))
-            .transpose()?;
+        let (data_node, object) = match embedded(attachment) {
+            Some(_) => (None, Some(sizing_node()?)),
+            None => (
+                (*content > 0)
+                    .then(|| NodeId::new(NodeIdType::Internal, 0x200 + index))
+                    .transpose()?,
+                None,
+            ),
+        };
         size = size
-            .checked_add(attachment_data(attachment, data_node)?.len())
-            .and_then(|size| size.checked_add(attachment.data.len()))
+            .checked_add(attachment_data(attachment, data_node, *content, object)?.len())
+            .and_then(|size| size.checked_add(*content))
             .ok_or(PstError::IntegerConversion)?;
     }
+    Ok(size)
+}
 
-    // Outlook excludes the six-byte HN client/root header from message-owned payloads.
-    i32::try_from(size.checked_sub(6).ok_or(PstError::IntegerConversion)?)
-        .map_err(|_| PstError::IntegerConversion.into())
+/// MailCraft: the size of what each attachment holds: its file, or its attached message's
+/// nodes ([`message_bytes`]).
+fn attachment_contents(
+    attachments: &[UnicodePstAttachment<'_>],
+    named: &NamedIds,
+    row_version: u32,
+) -> io::Result<Vec<usize>> {
+    attachments
+        .iter()
+        .map(|attachment| match embedded(attachment) {
+            Some(message) => message_bytes(
+                &message.message,
+                &message.attachments,
+                named,
+                sizing_node()?,
+                row_version,
+            ),
+            None => file_size(attachment),
+        })
+        .collect()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2163,6 +2210,7 @@ fn recipient_table_data(
 fn attachment_table_data(
     attachment_ids: &[NodeId],
     attachments: &[UnicodePstAttachment<'_>],
+    contents: &[usize],
     row_version: u32,
 ) -> io::Result<RebuiltRecipientTable> {
     let columns = vec![
@@ -2178,9 +2226,17 @@ fn attachment_table_data(
     let mut heap = HeapBuilder::new();
     let rows = attachment_ids
         .iter()
-        .zip(attachments)
-        .map(|(attachment_id, attachment)| {
-            let size = attachment_size(attachment)?;
+        .zip(attachments.iter().zip(contents))
+        .map(|(attachment_id, (attachment, content))| {
+            let size = attachment_size(attachment, *content)?;
+            // MailCraft: an attached message has no file name, and its own method.
+            let (filename, method) = match embedded(attachment) {
+                Some(_) => (None, ATTACH_EMBEDDED_MESSAGE),
+                None => (
+                    string_table_cell(PropertyType::Unicode, attachment.filename),
+                    ATTACH_BY_VALUE,
+                ),
+            };
             encode_table_row(
                 &row_context,
                 &mut heap,
@@ -2188,8 +2244,8 @@ fn attachment_table_data(
                 row_version,
                 vec![
                     Some(TableCell::Value(PropertyValue::Integer32(size))),
-                    string_table_cell(PropertyType::Unicode, attachment.filename),
-                    Some(TableCell::Value(PropertyValue::Integer32(1))),
+                    filename,
+                    Some(TableCell::Value(PropertyValue::Integer32(method))),
                     Some(TableCell::Value(PropertyValue::Integer32(-1))),
                     Some(TableCell::Value(PropertyValue::Integer32(
                         u32::from(*attachment_id) as i32,
@@ -2318,11 +2374,43 @@ fn message_data(
     property_context_pages(with_added(input, named, properties)?, 0x80)
 }
 
+/// An attachment's property context: `data_node` holds its file, when it has one, and `content`
+/// is the size of what it holds. MailCraft: `object` is its attached message's node, when it is
+/// one: `PidTagAttachDataObject` is then a `PtypObject` naming that node and its size, as
+/// MS-PST 2.4.6.2 keeps it, and its display name is given in place of a file's names and type.
 fn attachment_data(
     input: &UnicodePstAttachment<'_>,
     data_node: Option<NodeId>,
+    content: usize,
+    object: Option<NodeId>,
 ) -> io::Result<Vec<u8>> {
-    let size = attachment_size(input)?;
+    let size = attachment_size(input, content)?;
+    if let Some(node) = object {
+        let mut value = Vec::with_capacity(8);
+        node.write(&mut value)?;
+        value.write_u32::<byteorder::LittleEndian>(
+            u32::try_from(content).map_err(|_| PstError::IntegerConversion)?,
+        )?;
+        let mut properties = vec![
+            (0x0E20, PropertyType::Integer32, None, size as u32),
+            (
+                0x3001,
+                PropertyType::Unicode,
+                Some(utf16_bytes(input.filename)),
+                0,
+            ),
+            (0x3701, PropertyType::Object, Some(value), 0),
+            (
+                0x3705,
+                PropertyType::Integer32,
+                None,
+                ATTACH_EMBEDDED_MESSAGE as u32,
+            ),
+            (0x370B, PropertyType::Integer32, None, u32::MAX),
+        ];
+        with_attachment_properties(input, &mut properties)?;
+        return fitted_attachment(property_context_data(&properties)?);
+    }
     let mut properties = vec![
         (0x0E20, PropertyType::Integer32, None, size as u32),
         (0x3701, PropertyType::Binary, None, 0),
@@ -2359,10 +2447,24 @@ fn attachment_data(
             (0x3714, PropertyType::Integer32, None, 0x0000_0004),
         ]);
     }
-    property_context_data_with_nodes(
+    // MailCraft: its own added properties.
+    with_attachment_properties(input, &mut properties)?;
+    fitted_attachment(property_context_data_with_nodes(
         &properties,
         &data_node.map(|node| [(0x3701, node)]).unwrap_or_default(),
-    )
+    )?)
+}
+
+/// MailCraft: an attachment's property context is one block: one whose names and added
+/// properties make it bigger is an error, where it was written as a block no reader takes.
+fn fitted_attachment(data: Vec<u8>) -> io::Result<Vec<u8>> {
+    if data.len() > MAX_DATA_BLOCK_SIZE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "an attachment's names and properties don't fit in one block",
+        ));
+    }
+    Ok(data)
 }
 
 fn attachment_content_id<'a>(input: &'a UnicodePstAttachment<'_>) -> io::Result<Option<&'a str>> {
@@ -2380,14 +2482,14 @@ fn attachment_content_id<'a>(input: &'a UnicodePstAttachment<'_>) -> io::Result<
     Ok(Some(content_id))
 }
 
-fn attachment_size(input: &UnicodePstAttachment<'_>) -> io::Result<i32> {
+/// `PidTagAttachSize` of an attachment whose content (MailCraft: a file's bytes, or an attached
+/// message's nodes) takes `content` bytes.
+fn attachment_size(input: &UnicodePstAttachment<'_>, content: usize) -> io::Result<i32> {
     let filenames_size = utf16_bytes(input.filename)
         .len()
         .checked_mul(2)
         .ok_or(PstError::IntegerConversion)?;
-    let mut size = input
-        .data
-        .len()
+    let mut size = content
         .checked_add(12)
         .and_then(|size| size.checked_add(filenames_size))
         .and_then(|size| size.checked_add(utf16_bytes(input.mime_type).len()))
@@ -3266,13 +3368,66 @@ fn write_new_block<W: Write + Seek>(
     }
 }
 
+/// MailCraft: a message's nodes as blocks: its property context (the data tree's block, the
+/// first returned), and in its subnode tree (the second) its recipient table, its values too big
+/// for its heap and its attachments, an attached message's own nodes alike.
+#[allow(clippy::too_many_arguments)]
+fn push_message(
+    blocks: &mut Vec<NewBlock>,
+    next_bid: &mut u64,
+    next_offset: &mut FileSpace,
+    input: &UnicodePstMessage<'_>,
+    attachments: &[UnicodePstAttachment<'_>],
+    named: &NamedIds,
+    message: NodeId,
+    row_version: u32,
+    message_size: i32,
+    embedded_ids: &mut EmbeddedIds,
+) -> io::Result<(UnicodeBlockId, UnicodeBlockId)> {
+    let (message_pages, message_properties) = message_data(
+        input,
+        attachments,
+        named,
+        message,
+        row_version,
+        message_size,
+    )?;
+    let message_bid = push_data_tree_chunks(blocks, next_bid, next_offset, message_pages)?;
+    let (recipient_bid, recipient_subnodes) =
+        push_recipient_table(blocks, next_bid, next_offset, input.recipients, row_version)?;
+    let mut message_subnodes = vec![UnicodeLeafSubNodeTreeEntry::new(
+        NID_RECIPIENT_TABLE,
+        recipient_bid,
+        recipient_subnodes,
+    )];
+    for (node, data) in message_properties {
+        let data = push_data_tree(blocks, next_bid, next_offset, &data)?;
+        message_subnodes.push(UnicodeLeafSubNodeTreeEntry::new(node, data, None));
+    }
+    push_attachments(
+        blocks,
+        next_bid,
+        next_offset,
+        attachments,
+        named,
+        row_version,
+        &mut message_subnodes,
+        embedded_ids,
+    )?;
+    let message_subnode_bid = push_subnode_tree(blocks, next_bid, next_offset, message_subnodes)?;
+    Ok((message_bid, message_subnode_bid))
+}
+
+#[allow(clippy::too_many_arguments)]
 fn push_attachments(
     blocks: &mut Vec<NewBlock>,
     next_bid: &mut u64,
     next_offset: &mut FileSpace,
     attachments: &[UnicodePstAttachment<'_>],
+    named: &NamedIds,
     row_version: u32,
     sub_nodes: &mut Vec<UnicodeLeafSubNodeTreeEntry>,
+    embedded_ids: &mut EmbeddedIds,
 ) -> io::Result<()> {
     if attachments.is_empty() {
         return Ok(());
@@ -3284,8 +3439,9 @@ fn push_attachments(
             Ok(NodeId::new(NodeIdType::Attachment, 0x100 + index)?)
         })
         .collect::<io::Result<Vec<_>>>()?;
+    let contents = attachment_contents(attachments, named, row_version)?;
     let (table_pages, table_rows) =
-        attachment_table_data(&attachment_ids, attachments, row_version)?;
+        attachment_table_data(&attachment_ids, attachments, &contents, row_version)?;
     let table_block = push_data_tree_chunks(blocks, next_bid, next_offset, table_pages)?;
     let table_subnodes = if let Some((rows_node, rows)) = table_rows {
         let rows = push_data_tree_chunks(blocks, next_bid, next_offset, rows)?;
@@ -3304,20 +3460,51 @@ fn push_attachments(
         table_subnodes,
     ));
 
-    for (index, (attachment_id, attachment)) in
-        attachment_ids.into_iter().zip(attachments).enumerate()
+    for (index, ((attachment_id, attachment), content)) in attachment_ids
+        .into_iter()
+        .zip(attachments)
+        .zip(&contents)
+        .enumerate()
     {
-        let data_node = if attachment.data.is_empty() {
-            None
-        } else {
-            Some(NodeId::new(
+        // MailCraft: an attached message's nodes go in the attachment's own subnode tree, under
+        // the node its PtypObject names (MS-PST 2.4.6.2).
+        let (data_node, object, attachment_subnode) = if let Some(message) = embedded(attachment) {
+            let node = embedded_ids.take()?;
+            let size = content
+                .checked_sub(6)
+                .and_then(|size| i32::try_from(size).ok())
+                .ok_or(PstError::IntegerConversion)?;
+            let (data, subnodes) = push_message(
+                blocks,
+                next_bid,
+                next_offset,
+                &message.message,
+                &message.attachments,
+                named,
+                node,
+                row_version,
+                size,
+                embedded_ids,
+            )?;
+            let tree = push_block(
+                blocks,
+                next_bid,
+                next_offset,
+                true,
+                NewBlockData::SubNodes(vec![UnicodeLeafSubNodeTreeEntry::new(
+                    node,
+                    data,
+                    Some(subnodes),
+                )]),
+            )?;
+            (None, Some(node), Some(tree))
+        } else if *content > 0 {
+            let data_node = NodeId::new(
                 NodeIdType::Internal,
                 0x200 + u32::try_from(index).map_err(|_| PstError::IntegerConversion)?,
-            )?)
-        };
-        let attachment_subnode = if let Some(data_node) = data_node {
+            )?;
             let data_block = push_data_tree(blocks, next_bid, next_offset, attachment.data)?;
-            Some(push_block(
+            let tree = push_block(
                 blocks,
                 next_bid,
                 next_offset,
@@ -3325,16 +3512,17 @@ fn push_attachments(
                 NewBlockData::SubNodes(vec![UnicodeLeafSubNodeTreeEntry::new(
                     data_node, data_block, None,
                 )]),
-            )?)
+            )?;
+            (Some(data_node), None, Some(tree))
         } else {
-            None
+            (None, None, None)
         };
         let attachment_block = push_block(
             blocks,
             next_bid,
             next_offset,
             false,
-            NewBlockData::Data(attachment_data(attachment, data_node)?),
+            NewBlockData::Data(attachment_data(attachment, data_node, *content, object)?),
         )?;
         sub_nodes.push(UnicodeLeafSubNodeTreeEntry::new(
             attachment_id,
@@ -4488,6 +4676,8 @@ fn append_unicode_pst(
     }
     for input in inputs {
         check_message(&input.message)?;
+        // MailCraft: and its attachments, attached messages and all.
+        check_attachments(input.attachments, 0)?;
     }
     let requested_folder = folder_path
         .map(|folder_path| ensure_unicode_folder_path(path, folder_path, MAIL_CONTAINER_CLASS))
@@ -4549,6 +4739,13 @@ fn append_unicode_pst(
             Ok::<_, io::Error>(NodeId::new(NodeIdType::NormalMessage, index)?)
         })
         .collect::<io::Result<Vec<_>>>()?;
+    // MailCraft: attached messages get message IDs after these.
+    let mut embedded_ids = EmbeddedIds::new(
+        u32::try_from(inputs.len())
+            .ok()
+            .and_then(|count| message_index.checked_add(count))
+            .ok_or(PstError::IntegerConversion)?,
+    );
     let message_sizes = inputs
         .iter()
         .zip(&messages)
@@ -4634,46 +4831,17 @@ fn append_unicode_pst(
     {
         let mut blocks = Vec::new();
         let result = (|| {
-            let (message_pages, message_properties) = message_data(
+            let (message_bid, message_subnode_bid) = push_message(
+                &mut blocks,
+                &mut next_bid,
+                &mut next_offset,
                 &input.message,
                 input.attachments,
                 &named,
                 *message,
                 header.unique_value(),
                 *message_size,
-            )?;
-            let message_bid =
-                push_data_tree_chunks(&mut blocks, &mut next_bid, &mut next_offset, message_pages)?;
-            let recipient_table = NID_RECIPIENT_TABLE;
-            let (recipient_bid, recipient_subnodes) = push_recipient_table(
-                &mut blocks,
-                &mut next_bid,
-                &mut next_offset,
-                input.message.recipients,
-                header.unique_value(),
-            )?;
-            let mut message_subnodes = vec![UnicodeLeafSubNodeTreeEntry::new(
-                recipient_table,
-                recipient_bid,
-                recipient_subnodes,
-            )];
-            for (node, data) in message_properties {
-                let data = push_data_tree(&mut blocks, &mut next_bid, &mut next_offset, &data)?;
-                message_subnodes.push(UnicodeLeafSubNodeTreeEntry::new(node, data, None));
-            }
-            push_attachments(
-                &mut blocks,
-                &mut next_bid,
-                &mut next_offset,
-                input.attachments,
-                header.unique_value(),
-                &mut message_subnodes,
-            )?;
-            let message_subnode_bid = push_subnode_tree(
-                &mut blocks,
-                &mut next_bid,
-                &mut next_offset,
-                message_subnodes,
+                &mut embedded_ids,
             )?;
             write_pending_blocks(&mut file, &mut block_writer, &mut bbt_entries, &mut blocks)?;
             Ok::<_, io::Error>(UnicodeNodeBTreeEntry::new(
@@ -4928,7 +5096,8 @@ fn append_unicode_pst(
         blocks,
         next_bid,
         next_offset,
-        &messages,
+        // MailCraft: the attached messages' IDs are taken too.
+        &[messages, embedded_ids.given].concat(),
     )
 }
 
@@ -5637,6 +5806,7 @@ mod create_tests {
             mime_type: "text/plain",
             content_id: None,
             data: b"bulk attachment",
+            ..Default::default()
         };
         drop(
             UnicodePstFile::append_many_in_folder_with_attachments(
@@ -5724,6 +5894,7 @@ mod create_tests {
             mime_type: "image/png",
             content_id: Some("<>"),
             data: &[],
+            ..Default::default()
         }];
         let error = UnicodePstFile::append_many_with_attachments(
             &path,
@@ -5807,6 +5978,7 @@ mod create_tests {
             mime_type: "application/octet-stream",
             content_id: None,
             data: &attachment_data,
+            ..Default::default()
         }];
         let batch = messages
             .iter()
@@ -5859,6 +6031,7 @@ mod create_tests {
                     mime_type: "text/plain",
                     content_id: None,
                     data: b"folder attachment",
+                    ..Default::default()
                 }],
             )
             .unwrap(),
@@ -6009,6 +6182,7 @@ mod create_tests {
             mime_type: "image/png",
             content_id: Some("<large-image@example.com>"),
             data: &attachment_bytes,
+            ..Default::default()
         };
 
         drop(UnicodePstFile::create_with_attachments(&path, &input, &[attachment]).unwrap());
@@ -6090,6 +6264,7 @@ mod create_tests {
                     mime_type: "image/png",
                     content_id: Some("large-image@example.com"),
                     data: &attachment_bytes,
+                    ..Default::default()
                 }],
             )
             .unwrap(),
@@ -6152,7 +6327,10 @@ mod create_tests {
                     mime_type: "image/png",
                     content_id: Some("<>"),
                     data: &[],
+                    ..Default::default()
                 },
+                None,
+                0,
                 None,
             )
             .unwrap_err()
@@ -6220,6 +6398,7 @@ mod create_tests {
                     mime_type: "application/octet-stream",
                     content_id: None,
                     data: &large_attachment,
+                    ..Default::default()
                 }],
             )
             .unwrap(),
@@ -6528,6 +6707,7 @@ mod create_tests {
                 mime_type: "application/octet-stream",
                 content_id: None,
                 data: &attachment_bytes,
+                ..Default::default()
             }];
             drop(UnicodePstFile::set_store_display_name(&path, "Encoded").unwrap());
             drop(UnicodePstFile::append_with_attachments(&path, &input, &attachments).unwrap());
@@ -6822,6 +7002,7 @@ mod create_tests {
                     mime_type: "text/plain",
                     content_id: None,
                     data: &[],
+                    ..Default::default()
                 }],
             )
             .unwrap(),
@@ -6835,6 +7016,7 @@ mod create_tests {
                     mime_type: "text/plain",
                     content_id: None,
                     data: &[],
+                    ..Default::default()
                 }],
             )
             .unwrap(),

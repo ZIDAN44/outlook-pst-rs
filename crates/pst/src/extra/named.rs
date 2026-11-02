@@ -133,7 +133,10 @@ pub(crate) fn resolve(
 ) -> io::Result<NamedIds> {
     let mut wanted = Vec::new();
     for input in inputs {
-        for property in input.message.properties {
+        // The messages attached to it too, at any depth.
+        let mut messages = vec![&input.message];
+        embedded_messages(input.attachments, &mut messages);
+        for property in messages.iter().flat_map(|message| message.properties) {
             if let UnicodePstPropertyKey::Named(set, name) = property.key {
                 let key = NameKey::of(&set, name);
                 if !wanted.contains(&key) {

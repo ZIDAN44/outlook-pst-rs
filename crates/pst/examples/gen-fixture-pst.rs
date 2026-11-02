@@ -67,6 +67,7 @@ fn main() -> io::Result<()> {
         mime_type: "image/png",
         content_id: Some("<memex-inline@example.com>"),
         data: INLINE_PNG,
+        ..Default::default()
     };
     if stress {
         let data = vec![0xA5; 320 * 1_024];
@@ -75,12 +76,14 @@ fn main() -> io::Result<()> {
             mime_type: "application/octet-stream",
             content_id: None,
             data: &data,
+            ..Default::default()
         };
         let empty_attachment = UnicodePstAttachment {
             filename: "empty.txt",
             mime_type: "text/plain",
             content_id: None,
             data: &[],
+            ..Default::default()
         };
         drop(UnicodePstFile::create_with_attachments(
             &path,
