@@ -69,6 +69,12 @@ Every changed line is marked `MailCraft:` in a comment, with a test beside it.
 7. **`UnicodeAttachment::embedded_message()` and `AnsiAttachment::embedded_message()`** hand back
    the attached message as the file's own message type (kept beside the `Rc<dyn Message>` in
    `AttachmentData::Message`), so its own attachments read with `UnicodeAttachment::read`.
+8. **The root folder's hierarchy table reads** (`messaging/store.rs`): from upstream
+   (microsoft/outlook-pst-rs#55, commit `d0f9f001`, after 1.2.0), cherry-picked with its author,
+   so its lines carry no `MailCraft:` mark; drop it when a release has it.
+   `Store::root_hierarchy_table` held the file's lock while `TableContextReadWrite::read` locked
+   it again, so every call hung for good; the node is now found and the lock let go first.
+   Test: `messaging::store::tests` (fails on its time limit without the fix).
 
 Fixes 1 and 4 to 7 are also proved on whole files in MailCraft's
 `crates/net/src/data_files/pst/tests/reader.rs`: files made with `outlook-pst-rw` and changed

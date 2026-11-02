@@ -608,3 +608,27 @@ impl StoreReadWrite<AnsiPstFile> for AnsiStore {
         &self.inner.block_btree
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::{path::Path, sync::mpsc, thread, time::Duration};
+
+    /// MailCraft: the root folder's hierarchy table reads, where it used to lock the file again
+    /// while holding it and hang for good (upstream #55). Read on a thread with a time limit.
+    #[test]
+    fn root_hierarchy_table_does_not_hang() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/Empty.pst");
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let rows = crate::open_store(path)
+                .and_then(|store| store.root_hierarchy_table())
+                .map(|table| table.rows_matrix().count())
+                .map_err(|err| err.to_string());
+            let _ = sender.send(rows);
+        });
+        let rows = receiver
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the root hierarchy table hung");
+        assert!(rows.expect("the root hierarchy table reads") > 0);
+    }
+}
