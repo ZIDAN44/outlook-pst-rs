@@ -198,3 +198,70 @@ fn outlooks_special_folders_are_kept() {
     }
     std::fs::remove_file(path).unwrap();
 }
+
+/// An Inbox by another name (a file Outlook made in German) is found by what it records, not by
+/// its name: Drafts and Junk Email are recorded on it, and not on a folder named Inbox beside it.
+#[test]
+fn an_inbox_by_another_name_is_found_by_what_it_records() {
+    let path = temp_pst("special-renamed-inbox");
+    drop(
+        UnicodePstFile::create_in_folder(
+            &path,
+            &["Posteingang"],
+            &message("First", "<first@example.com>", &[]),
+        )
+        .unwrap(),
+    );
+    drop(UnicodePstFile::create_folder(&path, &["Inbox"], MAIL_CONTAINER_CLASS).unwrap());
+    // Outlook records the Calendar on its Inbox (PidTagIpmAppointmentEntryId).
+    let (posteingang, calendar) = {
+        let store = open_store(&path);
+        let (node, f) = folder(&store, &["Posteingang"]);
+        let record_key = *store.properties().record_key().unwrap().record_key();
+        let calendar = Vec::try_from(&EntryId::new(StoreRecordKey::new(record_key), node)).unwrap();
+        let mut properties = writable_folder_properties(f.as_ref());
+        properties.push((
+            0x36D0,
+            PropertyValue::Binary(BinaryValue::new(calendar.clone())),
+        ));
+        drop(f);
+        drop(store);
+        rewrite_properties(&path, vec![(node, properties)]).unwrap();
+        (node, calendar)
+    };
+
+    for role in [
+        UnicodePstSpecialFolder::Drafts,
+        UnicodePstSpecialFolder::JunkEmail,
+    ] {
+        drop(UnicodePstFile::set_special_folder(&path, role, &["Entw\u{fc}rfe"]).unwrap());
+        assert_eq!(
+            UnicodePstFile::special_folder(&path, role).unwrap(),
+            Some(vec!["Entw\u{fc}rfe".to_string()])
+        );
+    }
+    let store = open_store(&path);
+    let record_key = *store.properties().record_key().unwrap().record_key();
+    let drafts = Vec::try_from(&EntryId::new(
+        StoreRecordKey::new(record_key),
+        folder(&store, &["Entw\u{fc}rfe"]).0,
+    ))
+    .unwrap();
+    let open = |node| {
+        store
+            .open_folder(&store.properties().make_entry_id(node).unwrap())
+            .unwrap()
+    };
+    let f = open(posteingang);
+    let p = f.properties();
+    assert!(matches!(p.get(0x36D7), Some(PropertyValue::Binary(b)) if b.buffer() == drafts));
+    assert!(
+        matches!(p.get(0x36D8), Some(PropertyValue::MultipleBinary(v)) if v.get(4).is_some_and(|b| b.buffer() == drafts))
+    );
+    // What it recorded before stays.
+    assert!(matches!(p.get(0x36D0), Some(PropertyValue::Binary(b)) if b.buffer() == calendar));
+    let inbox = open(folder(&store, &["Inbox"]).0);
+    assert!(inbox.properties().get(0x36D7).is_none());
+    assert!(inbox.properties().get(0x36D8).is_none());
+    std::fs::remove_file(path).unwrap();
+}

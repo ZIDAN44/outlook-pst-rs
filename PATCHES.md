@@ -221,3 +221,14 @@ are the writer's own.
     Test: `extra::attach::tests::a_file_from_a_source_is_written_as_it_is_read` (20 MB through
     an XXBLOCK with no more than 4 MB of blocks waiting at once, where the same bytes given whole
     wait all together; read back byte for byte; sources that say more or less than they give).
+18. **The Inbox is found by what it records** (`extra/folders.rs`): Drafts and Junk Email are
+    recorded on the root folder, the IPM subtree and the Inbox, and the Inbox was the folder
+    named "Inbox". In a file Outlook made in another language ("Posteingang", "Boîte de
+    réception") there is none, so they were recorded on the other two alone. The Inbox is now
+    the folder at the top of the IPM subtree that records what MS-OXOSFLD 2.2 records on the
+    Inbox alone (the Calendar's, Contacts', Journal's, Notes', Tasks' and Drafts' entry IDs, or
+    `PidTagAdditionalRenEntryIds`), whatever its name; the folder named Inbox when none does.
+
+    Test: `extra::folders::tests::an_inbox_by_another_name_is_found_by_what_it_records` (Drafts
+    and Junk Email recorded on a "Posteingang" that records the Calendar, the values it had kept,
+    and not on a folder named Inbox beside it).

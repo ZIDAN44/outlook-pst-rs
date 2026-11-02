@@ -1,6 +1,6 @@
 //! MailCraft: folders made with a container class, and the special folders a file records
 //! (MS-OXOSFLD 2.2): Deleted Items, Sent Items and the Outbox on the store, Drafts and Junk Email
-//! on the root folder and the Inbox.
+//! on the root folder and the Inbox, found by what it records whatever its name.
 
 use super::*;
 
@@ -175,11 +175,47 @@ impl UnicodePstFile {
 fn recording_folders(store: &Rc<UnicodeStore>) -> io::Result<Vec<NodeId>> {
     let top = store.properties().ipm_sub_tree_entry_id()?.node_id();
     let mut nodes = vec![NID_ROOT_FOLDER, top];
-    if let Some(inbox) = find_child_folder(store, top, "Inbox")? {
+    if let Some(inbox) = find_inbox(store, top)? {
         nodes.push(inbox);
     }
     nodes.dedup();
     Ok(nodes)
+}
+
+/// The special folders MS-OXOSFLD 2.2 records on the Inbox (and the root folder) alone:
+/// `PidTagIpmAppointmentEntryId`, `PidTagIpmContactEntryId`, `PidTagIpmJournalEntryId`,
+/// `PidTagIpmNoteEntryId`, `PidTagIpmTaskEntryId`, `PidTagIpmDraftsEntryId` and
+/// `PidTagAdditionalRenEntryIds`.
+const INBOX_RECORDS: [u16; 7] = [0x36D0, 0x36D1, 0x36D2, 0x36D3, 0x36D4, 0x36D7, 0x36D8];
+
+/// MailCraft: the file's Inbox, among the folders at the top of the IPM subtree: the one that
+/// records the special folders the Inbox records, as Outlook's Inbox does in a file of any
+/// language ("Posteingang", "Boîte de réception"), else the one named Inbox. A folder that doesn't
+/// open is passed over.
+fn find_inbox(store: &Rc<UnicodeStore>, top: NodeId) -> io::Result<Option<NodeId>> {
+    let parent = store.open_folder(&store.properties().make_entry_id(top)?)?;
+    let Some(hierarchy) = parent.hierarchy_table() else {
+        return Ok(None);
+    };
+    let mut named = None;
+    for row in hierarchy.rows_matrix() {
+        let child = NodeId::from(u32::from(row.id()));
+        let Ok(folder) = store.open_folder(&store.properties().make_entry_id(child)?) else {
+            continue;
+        };
+        let properties = folder.properties();
+        if INBOX_RECORDS.iter().any(|id| properties.get(*id).is_some()) {
+            return Ok(Some(child));
+        }
+        if named.is_none()
+            && properties
+                .display_name()
+                .is_ok_and(|name| name.eq_ignore_ascii_case("Inbox"))
+        {
+            named = Some(child);
+        }
+    }
+    Ok(named)
 }
 
 /// A folder's names from the IPM subtree down to it; `None` when it isn't a folder under it (the
