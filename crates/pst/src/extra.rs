@@ -3,6 +3,11 @@
 
 use super::*;
 
+mod named;
+
+pub use named::UnicodePstName;
+pub(crate) use named::{push_map, resolve as resolve_named, NameKey, NamedIds};
+
 /// A value of a property added to a message ([`UnicodePstMessage::properties`]).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum UnicodePstValue<'a> {
@@ -52,16 +57,19 @@ impl UnicodePstValue<'_> {
 }
 
 /// Which property a value is for.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum UnicodePstPropertyKey {
+#[derive(Clone, Copy, Debug)]
+pub enum UnicodePstPropertyKey<'a> {
     /// A tagged property, by its ID (below 0x8000).
     Tag(u16),
+    /// A named property: its property set and its name in it. It is looked up in the file's
+    /// name-to-ID map, and added to it when it isn't there.
+    Named(GuidValue, UnicodePstName<'a>),
 }
 
 /// A property added to a message: it replaces the writer's own value of the same property.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug)]
 pub struct UnicodePstProperty<'a> {
-    pub key: UnicodePstPropertyKey,
+    pub key: UnicodePstPropertyKey<'a>,
     pub value: UnicodePstValue<'a>,
 }
 
@@ -70,6 +78,14 @@ impl<'a> UnicodePstProperty<'a> {
     pub fn tagged(id: u16, value: UnicodePstValue<'a>) -> Self {
         Self {
             key: UnicodePstPropertyKey::Tag(id),
+            value,
+        }
+    }
+
+    /// The named property `name` in the property set `set`.
+    pub fn named(set: GuidValue, name: UnicodePstName<'a>, value: UnicodePstValue<'a>) -> Self {
+        Self {
+            key: UnicodePstPropertyKey::Named(set, name),
             value,
         }
     }
@@ -91,41 +107,68 @@ const WRITER_OWNED: [u16; 5] = [
 ];
 
 /// A message's class and added properties are an error unless they can be written: a class,
-/// tagged IDs below 0x8000 (named ones have their own range), none of the writer's own, each
-/// once.
+/// tagged IDs below 0x8000 (named ones have their own range), none of the writer's own, string
+/// names that aren't empty or longer than 1,024 UTF-16 units, each property once.
 pub(crate) fn check_message(input: &UnicodePstMessage<'_>) -> io::Result<()> {
     let invalid = |message: &str| Err(io::Error::new(io::ErrorKind::InvalidInput, message));
     if input.message_class.is_empty() {
         return invalid("message class must not be empty");
     }
-    let mut seen = HashSet::new();
+    let mut tags = HashSet::new();
+    let mut names = HashSet::new();
     for property in input.properties {
-        let UnicodePstPropertyKey::Tag(id) = property.key;
-        if id == 0 || id >= 0x8000 {
-            return invalid("a tagged property's ID must be from 0x0001 to 0x7FFF");
-        }
-        if WRITER_OWNED.contains(&id) {
-            return invalid("the writer sets this property itself");
-        }
-        if !seen.insert(id) {
-            return invalid("a property is given twice");
+        match property.key {
+            UnicodePstPropertyKey::Tag(id) => {
+                if id == 0 || id >= 0x8000 {
+                    return invalid("a tagged property's ID must be from 0x0001 to 0x7FFF");
+                }
+                if WRITER_OWNED.contains(&id) {
+                    return invalid("the writer sets this property itself");
+                }
+                if !tags.insert(id) {
+                    return invalid("a property is given twice");
+                }
+            }
+            UnicodePstPropertyKey::Named(set, name) => {
+                if let UnicodePstName::String(name) = name {
+                    let units = name.encode_utf16().count();
+                    if units == 0 || units > named::MAX_NAME {
+                        return invalid("a named property's name must have 1 to 1,024 characters");
+                    }
+                }
+                if !names.insert(NameKey::of(&set, name)) {
+                    return invalid("a property is given twice");
+                }
+            }
         }
     }
     Ok(())
 }
 
-/// The value given for the tagged property `id`.
-fn tagged_value<'a>(input: &UnicodePstMessage<'a>, id: u16) -> Option<UnicodePstValue<'a>> {
+/// The property ID an added property is written with: its tag, or its name's ID in the file.
+fn property_id(key: &UnicodePstPropertyKey<'_>, named: &NamedIds) -> Option<u16> {
+    match key {
+        UnicodePstPropertyKey::Tag(id) => Some(*id),
+        UnicodePstPropertyKey::Named(set, name) => named.id(&NameKey::of(set, *name)),
+    }
+}
+
+/// The value given for the property `id`.
+fn value_for<'a>(
+    input: &UnicodePstMessage<'a>,
+    named: &NamedIds,
+    id: u16,
+) -> Option<UnicodePstValue<'a>> {
     input
         .properties
         .iter()
-        .find(|property| property.key == UnicodePstPropertyKey::Tag(id))
+        .find(|property| property_id(&property.key, named) == Some(id))
         .map(|property| property.value)
 }
 
 /// `PidTagMessageFlags`: as given (read when not), with `mfHasAttach` as the message is.
 pub(crate) fn message_flags(input: &UnicodePstMessage<'_>, has_attachments: bool) -> i32 {
-    let given = match tagged_value(input, 0x0E07) {
+    let given = match value_for(input, &NamedIds::default(), 0x0E07) {
         Some(UnicodePstValue::Integer32(flags)) => flags,
         _ => MESSAGE_FLAG_READ,
     };
@@ -143,13 +186,15 @@ pub(crate) fn unread(input: &UnicodePstMessage<'_>) -> bool {
 }
 
 /// The writer's own properties of a message (`properties`) with the added ones in place of the
-/// same IDs'.
+/// same IDs'; a named one is written with the ID `named` has for it.
 pub(crate) fn with_added(
     input: &UnicodePstMessage<'_>,
+    named: &NamedIds,
     mut properties: Vec<(u16, PropertyValue)>,
-) -> Vec<(u16, PropertyValue)> {
+) -> io::Result<Vec<(u16, PropertyValue)>> {
     for property in input.properties {
-        let UnicodePstPropertyKey::Tag(id) = property.key;
+        let id = property_id(&property.key, named)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "a named property has no ID"))?;
         // PidTagMessageFlags keeps mfHasAttach, which the writer sets.
         if id == 0x0E07 {
             continue;
@@ -157,19 +202,20 @@ pub(crate) fn with_added(
         properties.retain(|(existing, _)| *existing != id);
         properties.push((id, property.value.property_value()));
     }
-    properties
+    Ok(properties)
 }
 
 /// The contents table's cell for `column` from an added property: `None` when none is given for
 /// it, `Some(None)` when the column's type isn't the value's.
 pub(crate) fn added_table_cell(
     input: &UnicodePstMessage<'_>,
+    named: &NamedIds,
     column: &TableColumnDescriptor,
 ) -> io::Result<Option<Option<TableCell>>> {
     if column.prop_id() == 0x0E07 {
         return Ok(None);
     }
-    let Some(value) = tagged_value(input, column.prop_id()) else {
+    let Some(value) = value_for(input, named, column.prop_id()) else {
         return Ok(None);
     };
     let prop_type = column.prop_type();

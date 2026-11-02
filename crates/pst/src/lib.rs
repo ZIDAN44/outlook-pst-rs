@@ -29,7 +29,7 @@ mod encode;
 mod extra;
 
 use extra::*;
-pub use extra::{UnicodePstProperty, UnicodePstPropertyKey, UnicodePstValue};
+pub use extra::{UnicodePstName, UnicodePstProperty, UnicodePstPropertyKey, UnicodePstValue};
 
 use ltp::{
     heap::*, prop_context::*, prop_type::PropertyType, read_write::*, table_context::*, tree::*,
@@ -1438,10 +1438,12 @@ fn recipient_display_table_cell(
 fn message_size(
     input: &UnicodePstMessage<'_>,
     attachments: &[UnicodePstAttachment<'_>],
+    named: &NamedIds,
     message: NodeId,
     row_version: u32,
 ) -> io::Result<i32> {
-    let (message_pages, external) = message_data(input, attachments, message, row_version, 0)?;
+    let (message_pages, external) =
+        message_data(input, attachments, named, message, row_version, 0)?;
     let (recipient_pages, recipient_rows) = recipient_table_data(input.recipients, row_version)?;
     let attachment_ids = (0..attachments.len())
         .map(|index| {
@@ -1487,6 +1489,7 @@ fn new_message_table_cell(
     column: &TableColumnDescriptor,
     input: &UnicodePstMessage<'_>,
     attachments: &[UnicodePstAttachment<'_>],
+    named: &NamedIds,
     store_record_key: [u8; 16],
     folder: NodeId,
     message: NodeId,
@@ -1495,7 +1498,7 @@ fn new_message_table_cell(
 ) -> io::Result<Option<TableCell>> {
     let prop_type = column.prop_type();
     // MailCraft: an added property's value, as the message has it.
-    if let Some(cell) = added_table_cell(input, column)? {
+    if let Some(cell) = added_table_cell(input, named, column)? {
         return Ok(cell);
     }
     let cell = match column.prop_id() {
@@ -1695,6 +1698,7 @@ type ExternalValues = Vec<(NodeId, Vec<u8>)>;
 fn new_contents_rows(
     table: &dyn TableContext,
     inputs: &[UnicodePstBatchMessage<'_>],
+    named: &NamedIds,
     store_record_key: [u8; 16],
     folder: NodeId,
     messages: &[NodeId],
@@ -1717,6 +1721,7 @@ fn new_contents_rows(
                         column,
                         &input.message,
                         input.attachments,
+                        named,
                         store_record_key,
                         folder,
                         *message,
@@ -2244,6 +2249,7 @@ fn folder_data(name: &str, content_count: usize, has_subfolders: bool) -> io::Re
 fn message_data(
     input: &UnicodePstMessage<'_>,
     attachments: &[UnicodePstAttachment<'_>],
+    named: &NamedIds,
     message: NodeId,
     row_version: u32,
     message_size: i32,
@@ -2301,7 +2307,7 @@ fn message_data(
             PropertyValue::Binary(BinaryValue::new(html.as_bytes().to_vec())),
         ));
     }
-    property_context_pages(with_added(input, properties), 0x80)
+    property_context_pages(with_added(input, named, properties)?, 0x80)
 }
 
 fn attachment_data(
@@ -4476,6 +4482,10 @@ fn append_unicode_pst(
         .record_key()
         .map_err(|err| io::Error::new(err.kind(), format!("read store record key: {err}")))?
         .record_key();
+    // MailCraft: the IDs of the named properties the messages have, added to the file's map
+    // when it doesn't have them.
+    let named = resolve_named(&store, inputs)
+        .map_err(|err| io::Error::new(err.kind(), format!("name-to-ID map: {err}")))?;
     let folder =
         requested_folder
             .unwrap_or(default_receive_folder(&store, &nbt_entries).map_err(|err| {
@@ -4518,6 +4528,7 @@ fn append_unicode_pst(
             message_size(
                 &input.message,
                 input.attachments,
+                &named,
                 *message,
                 header.unique_value(),
             )
@@ -4597,6 +4608,7 @@ fn append_unicode_pst(
             let (message_pages, message_properties) = message_data(
                 &input.message,
                 input.attachments,
+                &named,
                 *message,
                 header.unique_value(),
                 *message_size,
@@ -4672,6 +4684,7 @@ fn append_unicode_pst(
         let (mut new_rows, external) = new_contents_rows(
             contents_table.as_ref(),
             inputs,
+            &named,
             store_record_key,
             folder,
             &messages,
@@ -4851,6 +4864,15 @@ fn append_unicode_pst(
         ),
     ]);
     nbt_entries.extend(message_entries);
+    if let Some(map) = named.new_map {
+        push_map(
+            map,
+            &mut nbt_entries,
+            &mut blocks,
+            &mut next_bid,
+            &mut next_offset,
+        )?;
+    }
 
     append_search_updates(
         &store,

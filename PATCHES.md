@@ -151,3 +151,21 @@ are the writer's own.
     twice is an `InvalidInput` error before the file is touched.
 
     Tests: `extra::tests`.
+
+14. **Named properties** (`extra/named.rs`, `extra.rs`, `lib.rs`): an added property's key can
+    be `UnicodePstPropertyKey::Named(set, name)`, a property set's GUID and a LID or a string
+    (`UnicodePstName`). Before a batch is written, each name is looked up in the file's
+    name-to-ID map (`NID_NAME_TO_ID_MAP`, MS-PST 2.4.7) and the ones it doesn't have are added:
+    the set to `PidTagNameidStreamGuid` unless it is PS_MAPI or PS_PUBLIC_STRINGS, a string to
+    `PidTagNameidStreamString` (its size, UTF-16, padding to 4 bytes), a `NAMEID` to
+    `PidTagNameidStreamEntry` with the next `wPropIdx`, and the same record, with a string's CRC
+    in place of its offset, to its hash bucket (`0x1000` + (LID or CRC XOR
+    `(wGuid << 1) | N`) mod `PidTagNameidBucketCount`). The property is then written with ID
+    `0x8000 + wPropIdx`, in the message and in a contents table column of that ID. Names the map
+    has keep their IDs; the map's node gets a new property context only when one is added. An
+    empty name, one over 1,024 UTF-16 units or a name given twice is an `InvalidInput` error, a
+    full map (`wPropIdx` past 0x7FFE) an `InvalidData` one.
+
+    Tests: `extra::named::tests` (Outlook's own map in `examples/Empty.pst` is hashed as the
+    writer hashes; names added to it and found again by later appends, read back with the
+    reader).
