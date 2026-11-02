@@ -3,8 +3,11 @@
 
 use super::*;
 
+mod folders;
 mod named;
 
+pub use folders::UnicodePstSpecialFolder;
+pub(crate) use folders::MAIL_CONTAINER_CLASS;
 pub use named::UnicodePstName;
 pub(crate) use named::{push_map, resolve as resolve_named, NameKey, NamedIds};
 

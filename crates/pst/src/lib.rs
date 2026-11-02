@@ -29,7 +29,10 @@ mod encode;
 mod extra;
 
 use extra::*;
-pub use extra::{UnicodePstName, UnicodePstProperty, UnicodePstPropertyKey, UnicodePstValue};
+pub use extra::{
+    UnicodePstName, UnicodePstProperty, UnicodePstPropertyKey, UnicodePstSpecialFolder,
+    UnicodePstValue,
+};
 
 use ltp::{
     heap::*, prop_context::*, prop_type::PropertyType, read_write::*, table_context::*, tree::*,
@@ -2225,7 +2228,12 @@ fn validate_folder_path(folder_path: &[&str]) -> io::Result<()> {
     Ok(())
 }
 
-fn folder_data(name: &str, content_count: usize, has_subfolders: bool) -> io::Result<Vec<u8>> {
+fn folder_data(
+    name: &str,
+    content_count: usize,
+    has_subfolders: bool,
+    container_class: &str,
+) -> io::Result<Vec<u8>> {
     let content_count = u32::try_from(content_count).map_err(|_| PstError::IntegerConversion)?;
     property_context_data(&[
         (0x3001, PropertyType::Unicode, Some(utf16_bytes(name)), 0),
@@ -2240,7 +2248,7 @@ fn folder_data(name: &str, content_count: usize, has_subfolders: bool) -> io::Re
         (
             0x3613,
             PropertyType::Unicode,
-            Some(utf16_bytes("IPF.Note")),
+            Some(utf16_bytes(container_class)),
             0,
         ),
     ])
@@ -3422,7 +3430,7 @@ fn create_unicode_pst(
         return Err(error);
     }
 
-    if let Err(error) = ensure_unicode_folder_path(path, &["Inbox"]) {
+    if let Err(error) = ensure_unicode_folder_path(path, &["Inbox"], MAIL_CONTAINER_CLASS) {
         let _ = std::fs::remove_file(path);
         return Err(error);
     }
@@ -3558,6 +3566,7 @@ fn new_folder_table_cell(
     store_record_key: [u8; 16],
     folder: NodeId,
     name: &str,
+    container_class: &str,
     has_subfolders: bool,
     row_version: u32,
 ) -> io::Result<Option<TableCell>> {
@@ -3576,7 +3585,7 @@ fn new_folder_table_cell(
         0x360A if prop_type == PropertyType::Boolean => {
             Some(TableCell::Value(PropertyValue::Boolean(has_subfolders)))
         }
-        0x3613 => string_table_cell(prop_type, "IPF.Note"),
+        0x3613 => string_table_cell(prop_type, container_class),
         0x0FFF if prop_type == PropertyType::Binary => {
             let entry_id = EntryId::new(StoreRecordKey::new(store_record_key), folder);
             Some(TableCell::Bytes(Vec::try_from(&entry_id)?))
@@ -3586,11 +3595,13 @@ fn new_folder_table_cell(
     Ok(cell)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn rebuild_hierarchy_table(
     table: &dyn TableContext,
     store_record_key: [u8; 16],
     folder: NodeId,
     name: &str,
+    container_class: &str,
     has_subfolders: bool,
     rows_node: NodeId,
     row_version: u32,
@@ -3605,6 +3616,7 @@ fn rebuild_hierarchy_table(
                 store_record_key,
                 folder,
                 name,
+                container_class,
                 has_subfolders,
                 row_version,
             )
@@ -4136,7 +4148,12 @@ fn set_unicode_store_display_name(path: &Path, name: &str) -> io::Result<()> {
     )
 }
 
-fn create_unicode_folder(path: &Path, parent: NodeId, name: &str) -> io::Result<NodeId> {
+fn create_unicode_folder(
+    path: &Path,
+    parent: NodeId,
+    name: &str,
+    container_class: &str,
+) -> io::Result<NodeId> {
     let mut file = OpenOptions::new().read(true).write(true).open(path)?;
     // MailCraft: folders are made in an encoded file too; its new blocks are encoded like the
     // rest.
@@ -4240,6 +4257,7 @@ fn create_unicode_folder(path: &Path, parent: NodeId, name: &str) -> io::Result<
                 store_record_key,
                 folder,
                 name,
+                container_class,
                 false,
                 rows_node,
                 header.unique_value(),
@@ -4303,7 +4321,7 @@ fn create_unicode_folder(path: &Path, parent: NodeId, name: &str) -> io::Result<
         &mut next_bid,
         &mut next_offset,
         false,
-        NewBlockData::Data(folder_data(name, 0, false)?),
+        NewBlockData::Data(folder_data(name, 0, false, container_class)?),
     )?;
     let folder_hierarchy = NodeId::new(NodeIdType::HierarchyTable, folder.index())?;
     let folder_hierarchy_bid = match hierarchy_template {
@@ -4429,18 +4447,29 @@ fn create_unicode_folder(path: &Path, parent: NodeId, name: &str) -> io::Result<
     Ok(folder)
 }
 
-fn ensure_unicode_folder_path(path: &Path, folder_path: &[&str]) -> io::Result<NodeId> {
+/// MailCraft: the folders made on the way get `PR_CONTAINER_CLASS` IPF.Note, the last one
+/// `container_class`; folders already there keep theirs.
+fn ensure_unicode_folder_path(
+    path: &Path,
+    folder_path: &[&str],
+    container_class: &str,
+) -> io::Result<NodeId> {
     validate_folder_path(folder_path)?;
     let pst = Rc::new(open_to_add(path)?);
     let mut store = UnicodeStore::read(pst)?;
     let mut parent = store.properties().ipm_sub_tree_entry_id()?.node_id();
-    for name in folder_path {
+    for (index, name) in folder_path.iter().enumerate() {
         if let Some(folder) = find_child_folder(&store, parent, name)? {
             parent = folder;
             continue;
         }
         // ponytail: one COW commit per missing segment; batch only if deep imports need it.
-        parent = create_unicode_folder(path, parent, name)?;
+        let class = if index + 1 == folder_path.len() {
+            container_class
+        } else {
+            MAIL_CONTAINER_CLASS
+        };
+        parent = create_unicode_folder(path, parent, name, class)?;
         store = UnicodeStore::read(Rc::new(open_to_add(path)?))?;
     }
     Ok(parent)
@@ -4461,7 +4490,7 @@ fn append_unicode_pst(
         check_message(&input.message)?;
     }
     let requested_folder = folder_path
-        .map(|folder_path| ensure_unicode_folder_path(path, folder_path))
+        .map(|folder_path| ensure_unicode_folder_path(path, folder_path, MAIL_CONTAINER_CLASS))
         .transpose()?;
     let mut file = OpenOptions::new().read(true).write(true).open(path)?;
     let mut header = UnicodeHeader::read(&mut file)?;

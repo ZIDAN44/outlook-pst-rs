@@ -169,3 +169,19 @@ are the writer's own.
     Tests: `extra::named::tests` (Outlook's own map in `examples/Empty.pst` is hashed as the
     writer hashes; names added to it and found again by later appends, read back with the
     reader).
+
+15. **Folders' container classes and the special folders a file records** (`extra/folders.rs`,
+    `lib.rs`): folders were always made `IPF.Note`. `UnicodePstFile::create_folder` makes the
+    missing folders of a path, the last with the `PR_CONTAINER_CLASS` given (the others, and
+    every folder `append*_in_folder` makes, `IPF.Note`), in the folder and in its row of the
+    parent's hierarchy table; folders already there keep theirs. `set_special_folder` records a
+    folder (made when missing) as one of `UnicodePstSpecialFolder` (MS-OXOSFLD 2.2): Deleted
+    Items, Sent Items and the Outbox in the store's `PidTagIpmWastebasketEntryId`,
+    `PidTagIpmSentMailEntryId` and `PidTagIpmOutboxEntryId`; Drafts in `PidTagIpmDraftsEntryId`
+    and Junk Email as the fifth value of `PidTagAdditionalRenEntryIds`, the others kept, on the
+    root folder, the IPM subtree and the Inbox. `special_folder` reads which folder a file
+    records, as names from the IPM subtree, so a caller adding to a file can use the ones it
+    has; `default_name` gives Outlook's name for a new file's.
+
+    Tests: `extra::folders::tests` (Outlook's empty file records Deleted Items, and keeps it and
+    the other `PidTagAdditionalRenEntryIds` values when Junk Email is recorded).
