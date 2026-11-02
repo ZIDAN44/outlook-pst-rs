@@ -24,8 +24,8 @@ pins its revisions. Drop the fork once a release has all of the fixes.
 
 Every changed line is marked `MailCraft:` in a comment, with a test beside it. Fixes 1 to 8 are
 the reader's, from `craft/1.2.0` (commits `560024b`, `4832e88`, `33c5231`, `647f6fd`, `38765ba`,
-`b3a2ed1`), cherry-picked with their authors onto the writer's copy of the reader; 9 to 12 are
-the writer's own.
+`b3a2ed1`), cherry-picked with their authors onto the writer's copy of the reader; 9 and up
+are the writer's own.
 
 1. **Reads are capped** (`ndb/block.rs`, `ndb/page.rs`, `ndb/read_write.rs`, `ltp/heap.rs`,
    `ltp/prop_context.rs`, `ltp/table_context.rs`, `messaging/message.rs`, `messaging/attachment.rs`,
@@ -136,3 +136,18 @@ the writer's own.
     Test: `create_tests::a_file_added_to_is_read_within_the_limit` (with the limit lowered on
     the test's thread, an append to a folder whose tables hold more is an error and leaves the
     file as it was).
+
+13. **A message has its own class and any tagged property** (`extra.rs`, `lib.rs`):
+    `UnicodePstMessage` takes `message_class` (`PR_MESSAGE_CLASS`, which was always `IPM.Note`)
+    and `properties`, tagged properties of the types `UnicodePstValue` has (16- and 32-bit
+    integers, booleans, times, strings, binaries, and multi-valued strings and binaries) that
+    replace the writer's own of the same ID. They go in the message's property context and in
+    the cells of its folder's contents table for the columns that table has (`PR_MESSAGE_FLAGS`,
+    `PR_IMPORTANCE`, `PR_CLIENT_SUBMIT_TIME`…). `PR_MESSAGE_FLAGS`, always 1 (read), is the
+    one given, its `mfHasAttach` kept as the message is; a message that goes in unread counts in
+    its folder's `PR_CONTENT_UNREAD` (0x3603) and in that folder's row of its parent's
+    hierarchy table, beside the content count. An empty class, an ID of 0 or from 0x8000, one
+    the writer works out itself (class, size, has-attachments, row ID and version) or one given
+    twice is an `InvalidInput` error before the file is touched.
+
+    Tests: `extra::tests`.

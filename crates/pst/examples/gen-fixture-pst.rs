@@ -59,6 +59,8 @@ fn main() -> io::Result<()> {
         html_body: Some(&html),
         message_id: "<memex-pst-export@example.com>",
         delivery_time: 133_750_080_000_000_000,
+        message_class: "IPM.Note",
+        properties: &[],
     };
     let inline_attachment = UnicodePstAttachment {
         filename: "inline.png",

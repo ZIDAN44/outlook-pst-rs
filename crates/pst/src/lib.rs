@@ -25,6 +25,11 @@ pub mod ndb;
 mod block_sig;
 mod crc;
 mod encode;
+// MailCraft: a message's class and added properties.
+mod extra;
+
+use extra::*;
+pub use extra::{UnicodePstProperty, UnicodePstPropertyKey, UnicodePstValue};
 
 use ltp::{
     heap::*, prop_context::*, prop_type::PropertyType, read_write::*, table_context::*, tree::*,
@@ -265,6 +270,12 @@ pub struct UnicodePstMessage<'a> {
     pub message_id: &'a str,
     /// Number of 100-nanosecond intervals since 1601-01-01 UTC.
     pub delivery_time: i64,
+    /// MailCraft: `PR_MESSAGE_CLASS`, such as `IPM.Note`.
+    pub message_class: &'a str,
+    /// MailCraft: properties written beside the writer's own, in place of the same ones; in the
+    /// message and in its row of the folder's contents table. `PR_MESSAGE_FLAGS` keeps
+    /// `mfHasAttach` as the message is (read when not given).
+    pub properties: &'a [UnicodePstProperty<'a>],
 }
 
 /// A by-value file attachment for the Unicode PST writer.
@@ -1483,6 +1494,10 @@ fn new_message_table_cell(
     message_size: i32,
 ) -> io::Result<Option<TableCell>> {
     let prop_type = column.prop_type();
+    // MailCraft: an added property's value, as the message has it.
+    if let Some(cell) = added_table_cell(input, column)? {
+        return Ok(cell);
+    }
     let cell = match column.prop_id() {
         LTP_ROW_ID_PROP_ID if prop_type == PropertyType::Integer32 => Some(TableCell::Value(
             PropertyValue::Integer32(u32::from(message) as i32),
@@ -1490,7 +1505,7 @@ fn new_message_table_cell(
         LTP_ROW_VERSION_PROP_ID if prop_type == PropertyType::Integer32 => Some(TableCell::Value(
             PropertyValue::Integer32(row_version as i32),
         )),
-        0x001A => string_table_cell(prop_type, "IPM.Note"),
+        0x001A => string_table_cell(prop_type, input.message_class),
         0x0037 | 0x0E1D | 0x0070 | 0x3001 => string_table_cell(prop_type, input.subject),
         0x0042 | 0x0C1A => string_table_cell(prop_type, input.sender_name),
         0x0C1F => string_table_cell(prop_type, input.sender_email),
@@ -1511,7 +1526,7 @@ fn new_message_table_cell(
             Some(TableCell::Value(PropertyValue::Integer32(0)))
         }
         0x0E07 if prop_type == PropertyType::Integer32 => Some(TableCell::Value(
-            PropertyValue::Integer32(1 | if attachments.is_empty() { 0 } else { 0x10 }),
+            PropertyValue::Integer32(message_flags(input, !attachments.is_empty())),
         )),
         0x0E08 if prop_type == PropertyType::Integer32 => {
             Some(TableCell::Value(PropertyValue::Integer32(message_size)))
@@ -1554,7 +1569,8 @@ fn rebuild_table(
     new_rows: Vec<(NodeId, Vec<Option<TableCell>>)>,
     rows_node: Option<NodeId>,
     row_version: u32,
-    property_update: Option<(NodeId, u16, PropertyValue)>,
+    // MailCraft: a row's cells, any number of them (a folder's content and unread counts).
+    property_update: Option<(NodeId, &[(u16, PropertyValue)])>,
     preserve_existing_rows: bool,
 ) -> io::Result<RebuiltTable> {
     let old_context = table.context();
@@ -1588,7 +1604,7 @@ fn rebuild_table(
         if preserve_existing_rows
             && property_update
                 .as_ref()
-                .is_none_or(|(update_row, _, _)| *update_row != row_id)
+                .is_none_or(|(update_row, _)| *update_row != row_id)
         {
             push_row(&mut row_chunks, old_row.writer_data()?)?;
             row_ids.push(row_id);
@@ -1618,13 +1634,14 @@ fn rebuild_table(
             }
         }
         let mut unique = old_row.unique();
-        if let Some((update_row, property, value)) = &property_update {
+        if let Some((update_row, updates)) = &property_update {
             if row_id == *update_row {
                 unique = row_version;
                 for (column, cell) in old_context.columns().iter().zip(&mut cells) {
-                    if column.prop_id() == *property
-                        && column.prop_type() == PropertyType::from(value)
-                    {
+                    if let Some((_, value)) = updates.iter().find(|(property, value)| {
+                        column.prop_id() == *property
+                            && column.prop_type() == PropertyType::from(value)
+                    }) {
                         *cell = Some(TableCell::Value(value.clone()));
                     } else if column.prop_id() == LTP_ROW_VERSION_PROP_ID
                         && column.prop_type() == PropertyType::Integer32
@@ -2235,7 +2252,7 @@ fn message_data(
     let unicode =
         |value: &str| PropertyValue::Unicode(UnicodeValue::new(value.encode_utf16().collect()));
     let mut properties = vec![
-        (0x001A, unicode("IPM.Note")),
+        (0x001A, unicode(input.message_class)),
         (0x0037, unicode(input.subject)),
         (0x0039, PropertyValue::Time(input.delivery_time)),
         (0x0042, unicode(input.sender_name)),
@@ -2245,7 +2262,7 @@ fn message_data(
         (0x0E06, PropertyValue::Time(input.delivery_time)),
         (
             0x0E07,
-            PropertyValue::Integer32(1 | if has_attachments { 0x10 } else { 0 }),
+            PropertyValue::Integer32(message_flags(input, has_attachments)),
         ),
         (0x0E08, PropertyValue::Integer32(message_size)),
         (0x0E17, PropertyValue::Integer32(0)),
@@ -2284,7 +2301,7 @@ fn message_data(
             PropertyValue::Binary(BinaryValue::new(html.as_bytes().to_vec())),
         ));
     }
-    property_context_pages(properties, 0x80)
+    property_context_pages(with_added(input, properties), 0x80)
 }
 
 fn attachment_data(
@@ -4325,7 +4342,7 @@ fn create_unicode_folder(path: &Path, parent: NodeId, name: &str) -> io::Result<
             vec![],
             Some(rows_node),
             header.unique_value(),
-            Some((parent, 0x360A, PropertyValue::Boolean(true))),
+            Some((parent, &[(0x360A, PropertyValue::Boolean(true))])),
             true,
         )?;
         let data = push_data_tree_chunks(&mut blocks, &mut next_bid, &mut next_offset, pages)?;
@@ -4433,6 +4450,9 @@ fn append_unicode_pst(
             io::ErrorKind::InvalidInput,
             "bulk append requires at least one message",
         ));
+    }
+    for input in inputs {
+        check_message(&input.message)?;
     }
     let requested_folder = folder_path
         .map(|folder_path| ensure_unicode_folder_path(path, folder_path))
@@ -4709,6 +4729,24 @@ fn append_unicode_pst(
 
     let content_count = i32::try_from(row_count).map_err(|_| PstError::IntegerConversion)?;
     set_folder_integer_property(&mut folder_properties, 0x3602, content_count);
+    // MailCraft: messages that go in unread count in the folder's unread count.
+    let unread_before = folder_properties
+        .iter()
+        .find_map(|(id, value)| match (id, value) {
+            (0x3603, PropertyValue::Integer32(count)) => Some((*count).max(0)),
+            _ => None,
+        })
+        .unwrap_or(0);
+    let unread_added = inputs.iter().filter(|input| unread(&input.message)).count();
+    let unread_count = i32::try_from(unread_added)
+        .ok()
+        .and_then(|added| unread_before.checked_add(added))
+        .ok_or(PstError::IntegerConversion)?;
+    set_folder_integer_property(&mut folder_properties, 0x3603, unread_count);
+    let counts = [
+        (0x3602, PropertyValue::Integer32(content_count)),
+        (0x3603, PropertyValue::Integer32(unread_count)),
+    ];
     let next_property_subnode = folder_subnodes
         .iter()
         .filter(|entry| matches!(entry.node().id_type(), Ok(NodeIdType::Internal)))
@@ -4743,6 +4781,16 @@ fn append_unicode_pst(
             .iter()
             .find(|entry| entry.node() == rows_node)
             .map(|entry| entry.block());
+        // MailCraft: the counts the table has columns for.
+        let cells: Vec<_> = counts
+            .iter()
+            .filter(|(id, value)| {
+                table.context().columns().iter().any(|column| {
+                    column.prop_id() == *id && column.prop_type() == PropertyType::from(value)
+                })
+            })
+            .cloned()
+            .collect();
         let patched = patch_table_row(
             &mut file,
             encoding,
@@ -4750,7 +4798,7 @@ fn append_unicode_pst(
             table.as_ref(),
             old_rows,
             folder,
-            &[(0x3602, PropertyValue::Integer32(content_count))],
+            &cells,
             header.unique_value(),
             &mut blocks,
             &mut next_bid,
@@ -4764,7 +4812,7 @@ fn append_unicode_pst(
                 vec![],
                 Some(rows_node),
                 header.unique_value(),
-                Some((folder, 0x3602, PropertyValue::Integer32(content_count))),
+                Some((folder, &counts)),
                 true,
             )?;
             (
@@ -4909,6 +4957,8 @@ mod create_tests {
             html_body: None,
             message_id: "<store-name@example.com>",
             delivery_time: 133_750_080_000_000_000,
+            message_class: "IPM.Note",
+            properties: &[],
         };
         drop(UnicodePstFile::create(&path, &input).unwrap());
         assert!(UnicodePstFile::set_store_display_name(&path, "").is_err());
@@ -4948,6 +4998,8 @@ mod create_tests {
             html_body: None,
             message_id: "<memex-pst-export@example.com>",
             delivery_time: 133_750_080_000_000_000,
+            message_class: "IPM.Note",
+            properties: &[],
         };
         let pst = UnicodePstFile::create(&path, &input).unwrap();
         assert_eq!(pst.header().version(), NdbVersion::Unicode);
@@ -5055,6 +5107,8 @@ mod create_tests {
             html_body: None,
             message_id: "<large-display-to@example.com>",
             delivery_time: 133_750_080_000_000_000,
+            message_class: "IPM.Note",
+            properties: &[],
         };
 
         drop(UnicodePstFile::create(&path, &input).unwrap());
@@ -5126,6 +5180,8 @@ mod create_tests {
             html_body: None,
             message_id: &ids[index],
             delivery_time: 133_750_080_000_000_000,
+            message_class: "IPM.Note",
+            properties: &[],
         };
         let batch = |range: std::ops::Range<usize>| range.map(message).collect::<Vec<_>>();
         let heap_pages = |path: &Path| {
@@ -5374,6 +5430,8 @@ mod create_tests {
             html_body: Some(&html),
             message_id: "<html@example.com>",
             delivery_time: 133_750_080_000_000_000,
+            message_class: "IPM.Note",
+            properties: &[],
         };
 
         drop(UnicodePstFile::create(&path, &input).unwrap());
@@ -5422,6 +5480,8 @@ mod create_tests {
             html_body: None,
             message_id: "<first@example.com>",
             delivery_time: 133_750_080_000_000_000,
+            message_class: "IPM.Note",
+            properties: &[],
         };
         let second = UnicodePstMessage {
             subject: "second",
@@ -5507,6 +5567,8 @@ mod create_tests {
             html_body: None,
             message_id: "<bulk-first@example.com>",
             delivery_time: 133_750_080_000_000_000,
+            message_class: "IPM.Note",
+            properties: &[],
         };
         drop(UnicodePstFile::create(&path, &first).unwrap());
         let second = UnicodePstMessage {
@@ -5602,6 +5664,8 @@ mod create_tests {
             html_body: None,
             message_id: "<bulk-error-first@example.com>",
             delivery_time: 133_750_080_000_000_000,
+            message_class: "IPM.Note",
+            properties: &[],
         };
         drop(UnicodePstFile::create(&path, &first).unwrap());
         let invalid_attachment = [UnicodePstAttachment {
@@ -5666,6 +5730,8 @@ mod create_tests {
             html_body: None,
             message_id: "<bulk-3000-first@example.com>",
             delivery_time: 133_750_080_000_000_000,
+            message_class: "IPM.Note",
+            properties: &[],
         };
         drop(UnicodePstFile::create(&path, &first).unwrap());
 
@@ -5729,6 +5795,8 @@ mod create_tests {
             html_body: None,
             message_id: "<folder-first@example.com>",
             delivery_time: 133_750_080_000_000_000,
+            message_class: "IPM.Note",
+            properties: &[],
         };
         drop(
             UnicodePstFile::create_in_folder_with_attachments(
@@ -5882,6 +5950,8 @@ mod create_tests {
             html_body: Some("<img src=\"cid:large-image@example.com\">"),
             message_id: "<large@example.com>",
             delivery_time: 133_750_080_000_000_000,
+            message_class: "IPM.Note",
+            properties: &[],
         };
         let attachment = UnicodePstAttachment {
             filename: "large.png",
@@ -6087,6 +6157,8 @@ mod create_tests {
             html_body: None,
             message_id: "<message-0@example.com>",
             delivery_time: 133_750_080_000_000_000,
+            message_class: "IPM.Note",
+            properties: &[],
         };
         drop(
             UnicodePstFile::create_with_attachments(
@@ -6236,6 +6308,8 @@ mod create_tests {
             html_body: None,
             message_id: "<existing-pst@example.com>",
             delivery_time: 133_750_080_000_000_000,
+            message_class: "IPM.Note",
+            properties: &[],
         };
         drop(UnicodePstFile::append(&path, &input).unwrap());
         drop(UnicodePstFile::append(&path, &input).unwrap());
@@ -6395,6 +6469,8 @@ mod create_tests {
                 html_body: Some("<p>encoded</p>"),
                 message_id: "<encoded@example.com>",
                 delivery_time: 133_750_080_000_000_000,
+                message_class: "IPM.Note",
+                properties: &[],
             };
             let attachments = [UnicodePstAttachment {
                 filename: "encoded.bin",
@@ -6522,6 +6598,8 @@ mod create_tests {
             html_body: None,
             message_id: "<kept@example.com>",
             delivery_time: 133_750_080_000_000_000,
+            message_class: "IPM.Note",
+            properties: &[],
         };
         let body = "a body that must survive ".repeat(200);
         for (label, fix_crc) in [("amap-crc", true), ("amap-stale", false)] {
@@ -6585,6 +6663,8 @@ mod create_tests {
             html_body: None,
             message_id: "<row@example.com>",
             delivery_time: 133_750_080_000_000_000,
+            message_class: "IPM.Note",
+            properties: &[],
         };
         drop(UnicodePstFile::create_in_folder(&path, &["Rows"], &message).unwrap());
         drop(UnicodePstFile::append_many_in_folder(&path, &["Rows"], &[message; 300]).unwrap());
@@ -6646,6 +6726,8 @@ mod create_tests {
             html_body: None,
             message_id: "<boundary-body@example.com>",
             delivery_time: 133_750_080_000_000_000,
+            message_class: "IPM.Note",
+            properties: &[],
         };
 
         drop(UnicodePstFile::create(&path, &input).unwrap());
@@ -6677,6 +6759,8 @@ mod create_tests {
             html_body: None,
             message_id: "<empty-attachment@example.com>",
             delivery_time: 133_750_080_000_000_000,
+            message_class: "IPM.Note",
+            properties: &[],
         };
         drop(
             UnicodePstFile::create_with_attachments(
