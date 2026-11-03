@@ -335,3 +335,71 @@ fn a_folder_listed_under_itself_is_looked_through_once() {
     );
     std::fs::remove_file(path).unwrap();
 }
+
+/// MailCraft: the Calendar, Contacts, the Journal, Notes and Tasks are made with their own
+/// container classes and recorded on the root folder, the IPM subtree and the Inbox; a folder
+/// already there keeps its class.
+#[test]
+fn pim_folders_are_made_with_their_class_and_recorded() {
+    const PIM: [(UnicodePstSpecialFolder, u16); 5] = [
+        (UnicodePstSpecialFolder::Calendar, 0x36D0),
+        (UnicodePstSpecialFolder::Contacts, 0x36D1),
+        (UnicodePstSpecialFolder::Journal, 0x36D2),
+        (UnicodePstSpecialFolder::Notes, 0x36D3),
+        (UnicodePstSpecialFolder::Tasks, 0x36D4),
+    ];
+    let path = temp_pst("special-pim");
+    drop(UnicodePstFile::create(&path, &message("First", "<first@example.com>", &[])).unwrap());
+    drop(UnicodePstFile::create_folder(&path, &["Journal"], "IPF.Note").unwrap());
+    for (role, _) in PIM {
+        assert_eq!(
+            UnicodePstFile::special_folder(&path, role).unwrap(),
+            None,
+            "{role:?}"
+        );
+        drop(UnicodePstFile::set_special_folder(&path, role, &[role.default_name()]).unwrap());
+    }
+    for (role, _) in PIM {
+        assert_eq!(
+            UnicodePstFile::special_folder(&path, role).unwrap(),
+            Some(vec![role.default_name().to_string()]),
+            "{role:?}"
+        );
+    }
+    let store = open_store(&path);
+    let class = |names: &[&str]| text(folder(&store, names).1.properties().get(0x3613));
+    assert_eq!(class(&["Calendar"]), "IPF.Appointment");
+    assert_eq!(class(&["Contacts"]), "IPF.Contact");
+    assert_eq!(class(&["Journal"]), "IPF.Note");
+    assert_eq!(class(&["Notes"]), "IPF.StickyNote");
+    assert_eq!(class(&["Tasks"]), "IPF.Task");
+    let record_key = *store.properties().record_key().unwrap().record_key();
+    let top = store
+        .properties()
+        .ipm_sub_tree_entry_id()
+        .unwrap()
+        .node_id();
+    let (inbox, _) = folder(&store, &["Inbox"]);
+    for node in [NID_ROOT_FOLDER, top, inbox] {
+        let f = store
+            .open_folder(&store.properties().make_entry_id(node).unwrap())
+            .unwrap();
+        for (role, id) in PIM {
+            let entry_id = Vec::try_from(&EntryId::new(
+                StoreRecordKey::new(record_key),
+                folder(&store, &[role.default_name()]).0,
+            ))
+            .unwrap();
+            assert!(
+                matches!(f.properties().get(id), Some(PropertyValue::Binary(b)) if b.buffer() == entry_id),
+                "{role:?}"
+            );
+        }
+    }
+    // The mail roles are as they were.
+    assert_eq!(
+        UnicodePstFile::special_folder(&path, UnicodePstSpecialFolder::DeletedItems).unwrap(),
+        Some(vec!["Deleted Items".to_string()])
+    );
+    std::fs::remove_file(path).unwrap();
+}

@@ -1,6 +1,7 @@
 //! MailCraft: folders made with a container class, and the special folders a file records
-//! (MS-OXOSFLD 2.2): Deleted Items, Sent Items and the Outbox on the store, Drafts and Junk Email
-//! on the root folder and the Inbox, found by what it records whatever its name.
+//! (MS-OXOSFLD 2.2): Deleted Items, Sent Items and the Outbox on the store; Drafts, Junk Email,
+//! the Calendar, Contacts, the Journal, Notes and Tasks on the root folder and the Inbox, found by
+//! what it records whatever its name.
 
 use super::*;
 
@@ -23,6 +24,16 @@ pub enum UnicodePstSpecialFolder {
     Drafts,
     /// `PidTagAdditionalRenEntryIds`' fifth value on the root folder and the Inbox.
     JunkEmail,
+    /// MailCraft: `PidTagIpmAppointmentEntryId` on the root folder and the Inbox.
+    Calendar,
+    /// MailCraft: `PidTagIpmContactEntryId` on the root folder and the Inbox.
+    Contacts,
+    /// MailCraft: `PidTagIpmJournalEntryId` on the root folder and the Inbox.
+    Journal,
+    /// MailCraft: `PidTagIpmNoteEntryId` on the root folder and the Inbox.
+    Notes,
+    /// MailCraft: `PidTagIpmTaskEntryId` on the root folder and the Inbox.
+    Tasks,
 }
 
 /// `PidTagAdditionalRenEntryIds`' value for Junk Email.
@@ -37,6 +48,24 @@ impl UnicodePstSpecialFolder {
             Self::Outbox => "Outbox",
             Self::Drafts => "Drafts",
             Self::JunkEmail => "Junk Email",
+            Self::Calendar => "Calendar",
+            Self::Contacts => "Contacts",
+            Self::Journal => "Journal",
+            Self::Notes => "Notes",
+            Self::Tasks => "Tasks",
+        }
+    }
+
+    /// MailCraft: the container class (`PR_CONTAINER_CLASS`) of its folder: what Outlook shows it
+    /// as (MS-OXOSFLD 2.2.2).
+    pub fn container_class(self) -> &'static str {
+        match self {
+            Self::Calendar => "IPF.Appointment",
+            Self::Contacts => "IPF.Contact",
+            Self::Journal => "IPF.Journal",
+            Self::Notes => "IPF.StickyNote",
+            Self::Tasks => "IPF.Task",
+            _ => MAIL_CONTAINER_CLASS,
         }
     }
 
@@ -49,6 +78,11 @@ impl UnicodePstSpecialFolder {
             Self::Outbox => (0x35E2, true),
             Self::Drafts => (0x36D7, false),
             Self::JunkEmail => (0x36D8, false),
+            Self::Calendar => (0x36D0, false),
+            Self::Contacts => (0x36D1, false),
+            Self::Journal => (0x36D2, false),
+            Self::Notes => (0x36D3, false),
+            Self::Tasks => (0x36D4, false),
         }
     }
 }
@@ -113,16 +147,17 @@ impl UnicodePstFile {
     }
 
     /// MailCraft: record the folder at `folder_path` (relative to the IPM subtree, made when
-    /// missing, as [`UnicodePstFile::create_folder`] makes it with `IPF.Note`) as `role`, in
-    /// place of any folder recorded before. Drafts and Junk Email are recorded on the root folder,
-    /// the IPM subtree and the Inbox.
+    /// missing, as [`UnicodePstFile::create_folder`] makes it with the role's
+    /// [`UnicodePstSpecialFolder::container_class`]) as `role`, in place of any folder recorded
+    /// before. The roles not kept on the store are recorded on the root folder, the IPM subtree
+    /// and the Inbox.
     pub fn set_special_folder(
         path: impl AsRef<Path>,
         role: UnicodePstSpecialFolder,
         folder_path: &[&str],
     ) -> io::Result<Self> {
         let path = path.as_ref();
-        let folder = ensure_unicode_folder_path(path, folder_path, MAIL_CONTAINER_CLASS)?;
+        let folder = ensure_unicode_folder_path(path, folder_path, role.container_class())?;
         let store = UnicodeStore::read(Rc::new(open_to_add(path)?))?;
         let record_key = *store.properties().record_key()?.record_key();
         let entry_id = EntryId::new(StoreRecordKey::new(record_key), folder);
@@ -170,8 +205,8 @@ impl UnicodePstFile {
     }
 }
 
-/// The folders Drafts and Junk Email are recorded on: the root folder, the IPM subtree and, when
-/// the file has one, the Inbox.
+/// The folders the roles not kept on the store are recorded on: the root folder, the IPM subtree
+/// and, when the file has one, the Inbox.
 fn recording_folders(store: &Rc<UnicodeStore>) -> io::Result<Vec<NodeId>> {
     let top = store.properties().ipm_sub_tree_entry_id()?.node_id();
     let mut nodes = vec![NID_ROOT_FOLDER, top];

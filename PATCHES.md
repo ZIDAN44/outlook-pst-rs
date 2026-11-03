@@ -247,3 +247,15 @@ are the writer's own.
     that type.
 
     Test: `extra::tests::a_message_keeps_its_class_and_added_properties` (0.4 read back).
+21. **The Calendar, Contacts, the Journal, Notes and Tasks as special folders**
+    (`extra/folders.rs`): `UnicodePstSpecialFolder` had the mail folders alone, so a file the
+    writer made had nowhere Outlook would take for its contacts, notes or tasks. `Calendar`,
+    `Contacts`, `Journal`, `Notes` and `Tasks` are recorded as MS-OXOSFLD 2.2 records them, in
+    `PidTagIpmAppointmentEntryId`, `PidTagIpmContactEntryId`, `PidTagIpmJournalEntryId`,
+    `PidTagIpmNoteEntryId` and `PidTagIpmTaskEntryId` on the root folder, the IPM subtree and the
+    Inbox, and found by `special_folder` as the others are. `container_class` gives each role's
+    `PR_CONTAINER_CLASS` (`IPF.Appointment`, `IPF.Contact`, `IPF.Journal`, `IPF.StickyNote`,
+    `IPF.Task`; `IPF.Note` for the mail ones), and `set_special_folder` makes a missing folder with
+    it; a folder already there keeps its own.
+
+    Test: `extra::folders::tests::pim_folders_are_made_with_their_class_and_recorded`.
