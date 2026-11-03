@@ -432,6 +432,22 @@ fn an_ansi_folder_is_found_again_by_its_name() {
     std::fs::remove_file(path).unwrap();
 }
 
+/// Making an ANSI file leaves the files beside it as they were: Outlook's template it starts
+/// from is written in the temporary folder, under a name no file has.
+#[test]
+fn a_new_ansi_file_leaves_its_neighbours_alone() {
+    let path = temp_pst("ansi-neighbours");
+    let mut beside = path.as_os_str().to_owned();
+    beside.push(".template");
+    let beside = std::path::PathBuf::from(beside);
+    std::fs::write(&beside, b"the user's own").unwrap();
+    drop(AnsiPstFile::create_empty(&path).unwrap());
+    assert_eq!(std::fs::read(&beside).unwrap(), b"the user's own");
+    check_ansi_file(&path);
+    std::fs::remove_file(beside).unwrap();
+    std::fs::remove_file(path).unwrap();
+}
+
 /// An ANSI file encoded as Outlook encodes its files (permute, or cyclic) is added to: its
 /// blocks read decoded, its new data blocks written encoded alike.
 #[test]

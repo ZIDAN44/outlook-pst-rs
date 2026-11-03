@@ -324,3 +324,9 @@ are the writer's own.
     caller that needs them apart names apart.
 
     Test: `extra::ansi::tests::an_ansi_folder_is_found_again_by_its_name`.
+26. **A new ANSI file leaves its neighbours alone** (`extra/ansi.rs`): `AnsiPstFile::create_empty`
+    wrote Outlook's empty Unicode file, which it reads its nodes from, to `<path>.template` over
+    any file of that name, then deleted it. The template is written to a new file in the
+    temporary folder, opened `create_new` under a name of the process, the time and a count.
+
+    Test: `extra::ansi::tests::a_new_ansi_file_leaves_its_neighbours_alone`.

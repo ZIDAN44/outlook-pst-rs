@@ -99,11 +99,8 @@ const HN_TABLE: u8 = 0x7C;
 /// Make an ANSI file at `path` from Outlook's empty file, then give it an Inbox. The file is
 /// removed again when it can't be made whole.
 fn create_empty_ansi_pst(path: &Path) -> io::Result<()> {
-    let mut name = path.as_os_str().to_owned();
-    name.push(".template");
-    let template = std::path::PathBuf::from(name);
+    let template = write_template()?;
     let made = (|| {
-        std::fs::write(&template, OUTLOOK_UNICODE_PST_TEMPLATE)?;
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -121,6 +118,47 @@ fn create_empty_ansi_pst(path: &Path) -> io::Result<()> {
         return Err(error);
     }
     Ok(())
+}
+
+/// How many names [`write_template`] tries before it gives up.
+const TEMPLATE_TRIES: u32 = 16;
+
+/// Outlook's empty Unicode file, which the reader reads from a file, written to a new file of
+/// its own in the temporary folder: never beside the file being made, where a file of the user's
+/// could have its name, and never over a file already there.
+fn write_template() -> io::Result<std::path::PathBuf> {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_nanos())
+        .unwrap_or(0);
+    let mut last = io::Error::from(io::ErrorKind::AlreadyExists);
+    for _ in 0..TEMPLATE_TRIES {
+        let template = std::env::temp_dir().join(format!(
+            "outlook-pst-template-{}-{stamp}-{}.pst",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let mut file = match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&template)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                last = error;
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        if let Err(error) = file.write_all(OUTLOOK_UNICODE_PST_TEMPLATE) {
+            drop(file);
+            let _ = std::fs::remove_file(&template);
+            return Err(error);
+        }
+        return Ok(template);
+    }
+    Err(last)
 }
 
 /// Write each node of the Unicode file at `template` into `file`, a new ANSI file at `path`.
