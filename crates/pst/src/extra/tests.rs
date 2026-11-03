@@ -38,7 +38,9 @@ pub(crate) fn folder(store: &Rc<UnicodeStore>, path: &[&str]) -> (NodeId, Rc<dyn
         .unwrap()
         .node_id();
     for name in path {
-        node = find_child_folder(store, node, name).unwrap().unwrap();
+        node = find_child_folder(store.as_ref(), node, name)
+            .unwrap()
+            .unwrap();
     }
     let folder = store
         .open_folder(&store.properties().make_entry_id(node).unwrap())

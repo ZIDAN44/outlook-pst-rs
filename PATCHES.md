@@ -278,3 +278,37 @@ are the writer's own.
 
     Tests: `extra::tests::recipients_keep_their_flags_and_track_status` (a new file and one added
     to), `extra::attach::tests` (an attached message's recipient).
+24. **Outlook 97–2002's ANSI files are added to** (`extra/format.rs`, `extra/format/layout.rs`,
+    `extra/ansi.rs`, `lib.rs`, `extra/folders.rs`, `extra/named.rs`, `extra/attach.rs`;
+    `ndb/header.rs`, `ndb/root.rs` and `ndb/page.rs` get the ANSI setters the Unicode types
+    had): the writer wrote Unicode files alone. It keeps one model of a file, in the Unicode types, whose IDs and offsets are the
+    wider; an ANSI file's header, B-tree pages and blocks are read with the reader's Ansi types
+    and widened (`FileHeader`, `read_block_btree`, `read_tree_block`, `collect_subnode_entries`),
+    and narrowed back where they are written, each BID and IB checked (`write_ansi_block`,
+    `write_ansi_btree_page`): 12-byte trailers, 8,180 bytes of data in a block (the row matrix's
+    rows per block and every data tree's blocks but the last, MS-PST 2.3.4.4), 2,043 BIDs to an
+    XBLOCK, 4-byte SLBLOCK and SIBLOCK headers with 12- and 8-byte entries, 41 and 31 entries to
+    a B-tree page. Above that layer the two differ in the strings, which are all 8-bit in an ANSI
+    file (MS-PST 2.5: "for an ANSI PST, all string properties are stored in ANSI encoding";
+    `Text`): a message's in Windows-1252 when its text, recipients and attachments' names are all
+    in it, else in UTF-8, with `PidTagMessageCodepage` (MS-OXCMSG 2.2.1.4) saying which, and the
+    store's and folders' names, which no property gives a code page for, in Windows-1252 (a `?`
+    for a character it hasn't); named properties' names stay UTF-16, as MS-PST 2.4.7 keeps them
+    in an ANSI file too. A table's row index keeps a 16-bit row number (MS-PST 2.3.4.3.1), so an
+    ANSI folder holds 65,536 items at most, and the file stops at the end of the header's FPMap,
+    the only one an ANSI file has (MS-PST 1.3.2.8: about 1.94 GB): both are an error before
+    anything is written past them. `AnsiPstFile` takes `append_many_with_attachments`,
+    `append_many_in_folder_with_attachments`, `create_folder`, `special_folder`,
+    `set_special_folder` and `set_store_display_name`, the same calls as `UnicodePstFile`'s, and
+    `create_empty`, Outlook's empty file written again in the ANSI format (each property context
+    and table with 8-bit strings and 16-bit row numbers, the store not saying `STORE_UNICODE_OK`)
+    with an Inbox the writer makes. Each type takes its own format: a file in the other one is an
+    `InvalidInput` error before it is touched. Encoded ANSI files are added to as Unicode ones
+    are (fix 10).
+
+    Tests: `extra::ansi::tests` (a new ANSI file read with the reader, every block's trailer, CRC
+    and signature checked and no two blocks or pages sharing space; messages with recipients, a
+    body over a block, HTML and a 20,000-byte file in Windows-1252 and in UTF-8, a batch of 40
+    whose rows go in place, read back; folders made and recorded as special folders; permute- and
+    cyclic-encoded ANSI files added to; each format refused by the other's type; the 2 GB and
+    65,536-row limits; the code pages).

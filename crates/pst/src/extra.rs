@@ -3,8 +3,10 @@
 
 use super::*;
 
+mod ansi;
 mod attach;
 mod folders;
+mod format;
 mod named;
 
 #[cfg(test)]
@@ -19,6 +21,7 @@ pub use attach::{
 };
 pub use folders::UnicodePstSpecialFolder;
 pub(crate) use folders::MAIL_CONTAINER_CLASS;
+pub(crate) use format::*;
 pub use named::UnicodePstName;
 pub(crate) use named::{push_map, resolve as resolve_named, NameKey, NamedIds};
 
@@ -228,6 +231,7 @@ pub(crate) fn added_table_cell(
     input: &UnicodePstMessage<'_>,
     named: &NamedIds,
     column: &TableColumnDescriptor,
+    text: Text,
 ) -> io::Result<Option<Option<TableCell>>> {
     if column.prop_id() == 0x0E07 {
         return Ok(None);
@@ -236,10 +240,11 @@ pub(crate) fn added_table_cell(
         return Ok(None);
     };
     let prop_type = column.prop_type();
-    if let (UnicodePstValue::Unicode(text), PropertyType::String8) = (value, prop_type) {
-        return Ok(Some(string_table_cell(prop_type, text)));
+    if let UnicodePstValue::Unicode(value) = value {
+        return Ok(Some(string_table_cell(prop_type, value, text)));
     }
-    let value = value.property_value();
+    // MailCraft: an ANSI file's strings are 8-bit.
+    let value = text.narrow(value.property_value());
     if PropertyType::from(&value) != prop_type {
         return Ok(Some(None));
     }

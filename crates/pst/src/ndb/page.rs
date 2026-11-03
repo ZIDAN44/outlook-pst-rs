@@ -1515,6 +1515,11 @@ impl AnsiBlockBTreeEntry {
             ref_count: 1,
         }
     }
+
+    /// MailCraft: the writer adds to ANSI files too.
+    pub(crate) fn set_ref_count(&mut self, ref_count: u16) {
+        self.ref_count = ref_count;
+    }
 }
 
 impl BTreeEntry for AnsiBlockBTreeEntry {

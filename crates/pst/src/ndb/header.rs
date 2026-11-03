@@ -434,6 +434,38 @@ impl AnsiHeader {
             reserved3: [0; 36],
         }
     }
+
+    /// MailCraft: the writer adds to ANSI files too.
+    pub(crate) fn set_next_block(&mut self, next_block: AnsiBlockId) {
+        self.next_block = next_block;
+    }
+
+    /// MailCraft: the writer adds to ANSI files too.
+    pub(crate) fn set_next_page(&mut self, next_page: AnsiPageId) {
+        self.next_page = next_page;
+    }
+
+    /// MailCraft: a test re-encodes an ANSI file the writer made.
+    #[cfg(test)]
+    pub(crate) fn set_crypt_method(&mut self, crypt_method: NdbCryptMethod) {
+        self.crypt_method = crypt_method;
+    }
+
+    /// MailCraft: the writer adds to ANSI files too.
+    pub(crate) fn next_node_index(&self, id_type: NodeIdType) -> NdbResult<u32> {
+        Ok(self.nids[usize::try_from(id_type)?])
+    }
+
+    /// MailCraft: the writer adds to ANSI files too.
+    pub(crate) fn reserve_node(&mut self, node: NodeId) -> NdbResult<()> {
+        let slot = usize::try_from(node.id_type()?)?;
+        let next = node
+            .index()
+            .checked_add(1)
+            .ok_or(NdbError::InvalidNodeIndex(node.index()))?;
+        self.nids[slot] = self.nids[slot].max(next);
+        Ok(())
+    }
 }
 
 impl Header<AnsiPstFile> for AnsiHeader {

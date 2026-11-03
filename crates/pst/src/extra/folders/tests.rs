@@ -330,7 +330,7 @@ fn a_folder_listed_under_itself_is_looked_through_once() {
         .collect();
     assert_eq!(rows, [a, a]);
     assert_eq!(
-        folder_names(&store, NodeId::from(0x7FFF_FFE2)).unwrap(),
+        folder_names(store.as_ref(), NodeId::from(0x7FFF_FFE2)).unwrap(),
         None
     );
     std::fs::remove_file(path).unwrap();

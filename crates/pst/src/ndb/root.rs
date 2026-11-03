@@ -222,6 +222,17 @@ impl AnsiRoot {
             reserved3: Default::default(),
         }
     }
+
+    /// MailCraft: the writer adds to ANSI files too.
+    pub(crate) fn set_file_eof_index(&mut self, file_eof_index: AnsiByteIndex) {
+        self.file_eof_index = file_eof_index;
+    }
+
+    /// MailCraft: the writer adds to ANSI files too.
+    pub(crate) fn set_btrees(&mut self, node_btree: AnsiPageRef, block_btree: AnsiPageRef) {
+        self.node_btree = node_btree;
+        self.block_btree = block_btree;
+    }
 }
 
 impl Root<AnsiPstFile> for AnsiRoot {

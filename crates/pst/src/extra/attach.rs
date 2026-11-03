@@ -174,12 +174,14 @@ pub(crate) fn embedded_messages<'b>(
 pub(crate) fn with_attachment_properties(
     input: &UnicodePstAttachment<'_>,
     properties: &mut Vec<(u16, PropertyType, Option<Vec<u8>>, u32)>,
+    text: Text,
 ) -> io::Result<()> {
     for property in input.properties {
         let UnicodePstPropertyKey::Tag(id) = property.key else {
             continue;
         };
-        let value = property.value.property_value();
+        // MailCraft: a string is 8-bit in an ANSI file.
+        let value = text.narrow(property.value.property_value());
         let prop_type = PropertyType::from(&value);
         let record = match small_property_record(&value) {
             Some(small) => (id, prop_type, None, small),
@@ -207,10 +209,12 @@ pub(crate) fn push_data_tree_source(
     flush: &mut dyn FnMut(&mut Vec<NewBlock>) -> io::Result<()>,
 ) -> io::Result<UnicodeBlockId> {
     let mut reader = source.open()?;
-    let mut leaves = Vec::with_capacity(size.div_ceil(MAX_DATA_BLOCK_SIZE));
+    // MailCraft: the blocks but the last are as big as the file's format makes a block.
+    let block_size = next_offset.format.data_block_size();
+    let mut leaves = Vec::with_capacity(size.div_ceil(block_size));
     let mut left = size;
     while left > 0 {
-        let mut chunk = vec![0; left.min(MAX_DATA_BLOCK_SIZE)];
+        let mut chunk = vec![0; left.min(block_size)];
         reader.read_exact(&mut chunk).map_err(|err| {
             io::Error::new(
                 err.kind(),

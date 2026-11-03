@@ -206,6 +206,11 @@ pub struct String8Value {
 }
 
 impl String8Value {
+    /// MailCraft: an 8-bit string the writer writes into an ANSI file, without its NUL.
+    pub(crate) fn new(buffer: Vec<u8>) -> Self {
+        Self { buffer }
+    }
+
     pub fn buffer(&self) -> &[u8] {
         &self.buffer
     }

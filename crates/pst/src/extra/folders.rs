@@ -96,13 +96,8 @@ impl UnicodePstFile {
         folder_path: &[&str],
         container_class: &str,
     ) -> io::Result<Self> {
-        if container_class.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "container class must not be empty",
-            ));
-        }
-        ensure_unicode_folder_path(path.as_ref(), folder_path, container_class)?;
+        expect_format(path.as_ref(), Format::Unicode)?;
+        create_folder(path.as_ref(), folder_path, container_class)?;
         Self::open(path)
     }
 
@@ -112,38 +107,7 @@ impl UnicodePstFile {
         path: impl AsRef<Path>,
         role: UnicodePstSpecialFolder,
     ) -> io::Result<Option<Vec<String>>> {
-        let store = UnicodeStore::read(Rc::new(open_to_add(path.as_ref())?))?;
-        let (id, on_store) = role.property();
-        let entry_ids = if on_store {
-            vec![store.properties().get(id).cloned()]
-        } else {
-            recording_folders(&store)?
-                .into_iter()
-                .map(|node| {
-                    let folder = store.open_folder(&store.properties().make_entry_id(node)?)?;
-                    Ok::<_, io::Error>(folder.properties().get(id).cloned())
-                })
-                .collect::<io::Result<Vec<_>>>()?
-        };
-        for value in entry_ids.into_iter().flatten() {
-            let entry_id = match (&value, role) {
-                (PropertyValue::MultipleBinary(values), UnicodePstSpecialFolder::JunkEmail) => {
-                    values.get(JUNK_INDEX).map(|value| value.buffer().to_vec())
-                }
-                (PropertyValue::Binary(value), _) => Some(value.buffer().to_vec()),
-                _ => None,
-            };
-            let Some(node) = entry_id
-                .and_then(|bytes| EntryId::try_from(bytes.as_slice()).ok())
-                .map(|entry_id| entry_id.node_id())
-            else {
-                continue;
-            };
-            if let Some(names) = folder_names(&store, node)? {
-                return Ok(Some(names));
-            }
-        }
-        Ok(None)
+        special_folder(path.as_ref(), role)
     }
 
     /// MailCraft: record the folder at `folder_path` (relative to the IPM subtree, made when
@@ -156,58 +120,123 @@ impl UnicodePstFile {
         role: UnicodePstSpecialFolder,
         folder_path: &[&str],
     ) -> io::Result<Self> {
-        let path = path.as_ref();
-        let folder = ensure_unicode_folder_path(path, folder_path, role.container_class())?;
-        let store = UnicodeStore::read(Rc::new(open_to_add(path)?))?;
-        let record_key = *store.properties().record_key()?.record_key();
-        let entry_id = EntryId::new(StoreRecordKey::new(record_key), folder);
-        let entry_id = Vec::try_from(&entry_id)?;
-        let (id, on_store) = role.property();
-        let set = |properties: &mut Vec<(u16, PropertyValue)>| {
-            let value = if role == UnicodePstSpecialFolder::JunkEmail {
-                let mut values = match properties.iter().find(|(existing, _)| *existing == id) {
-                    Some((_, PropertyValue::MultipleBinary(values))) => values.clone(),
-                    _ => Vec::new(),
-                };
-                if values.len() <= JUNK_INDEX {
-                    values.resize(JUNK_INDEX + 1, BinaryValue::new(Vec::new()));
-                }
-                if let Some(slot) = values.get_mut(JUNK_INDEX) {
-                    *slot = BinaryValue::new(entry_id.clone());
-                }
-                PropertyValue::MultipleBinary(values)
-            } else {
-                PropertyValue::Binary(BinaryValue::new(entry_id.clone()))
-            };
-            properties.retain(|(existing, _)| *existing != id);
-            properties.push((id, value));
-        };
-        let mut updates = Vec::new();
-        if on_store {
-            let mut properties: Vec<_> = store
-                .properties()
-                .iter()
-                .map(|(id, value)| (*id, value.clone()))
-                .collect();
-            set(&mut properties);
-            updates.push((NID_MESSAGE_STORE, properties));
-        } else {
-            for node in recording_folders(&store)? {
-                let folder = store.open_folder(&store.properties().make_entry_id(node)?)?;
-                let mut properties = writable_folder_properties(folder.as_ref());
-                set(&mut properties);
-                updates.push((node, properties));
-            }
-        }
-        drop(store);
-        rewrite_properties(path, updates)?;
+        expect_format(path.as_ref(), Format::Unicode)?;
+        set_special_folder(path.as_ref(), role, folder_path)?;
         Self::open(path)
     }
 }
 
+/// MailCraft: make the folders of `folder_path` that are missing, in a file of either format
+/// ([`UnicodePstFile::create_folder`], [`AnsiPstFile::create_folder`]).
+pub(crate) fn create_folder(
+    path: &Path,
+    folder_path: &[&str],
+    container_class: &str,
+) -> io::Result<()> {
+    if container_class.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "container class must not be empty",
+        ));
+    }
+    ensure_unicode_folder_path(path, folder_path, container_class)?;
+    Ok(())
+}
+
+/// The folder a file of either format records as `role` ([`UnicodePstFile::special_folder`]).
+pub(crate) fn special_folder(
+    path: &Path,
+    role: UnicodePstSpecialFolder,
+) -> io::Result<Option<Vec<String>>> {
+    let store = AddStore::open(path)?;
+    let (id, on_store) = role.property();
+    let entry_ids = if on_store {
+        vec![store.properties().get(id).cloned()]
+    } else {
+        recording_folders(&*store)?
+            .into_iter()
+            .map(|node| {
+                let folder = store.open_folder(&store.properties().make_entry_id(node)?)?;
+                Ok::<_, io::Error>(folder.properties().get(id).cloned())
+            })
+            .collect::<io::Result<Vec<_>>>()?
+    };
+    for value in entry_ids.into_iter().flatten() {
+        let entry_id = match (&value, role) {
+            (PropertyValue::MultipleBinary(values), UnicodePstSpecialFolder::JunkEmail) => {
+                values.get(JUNK_INDEX).map(|value| value.buffer().to_vec())
+            }
+            (PropertyValue::Binary(value), _) => Some(value.buffer().to_vec()),
+            _ => None,
+        };
+        let Some(node) = entry_id
+            .and_then(|bytes| EntryId::try_from(bytes.as_slice()).ok())
+            .map(|entry_id| entry_id.node_id())
+        else {
+            continue;
+        };
+        if let Some(names) = folder_names(&*store, node)? {
+            return Ok(Some(names));
+        }
+    }
+    Ok(None)
+}
+
+/// Record a folder of a file of either format as `role` ([`UnicodePstFile::set_special_folder`]).
+pub(crate) fn set_special_folder(
+    path: &Path,
+    role: UnicodePstSpecialFolder,
+    folder_path: &[&str],
+) -> io::Result<()> {
+    let folder = ensure_unicode_folder_path(path, folder_path, role.container_class())?;
+    let store = AddStore::open(path)?;
+    let record_key = *store.properties().record_key()?.record_key();
+    let entry_id = EntryId::new(StoreRecordKey::new(record_key), folder);
+    let entry_id = Vec::try_from(&entry_id)?;
+    let (id, on_store) = role.property();
+    let set = |properties: &mut Vec<(u16, PropertyValue)>| {
+        let value = if role == UnicodePstSpecialFolder::JunkEmail {
+            let mut values = match properties.iter().find(|(existing, _)| *existing == id) {
+                Some((_, PropertyValue::MultipleBinary(values))) => values.clone(),
+                _ => Vec::new(),
+            };
+            if values.len() <= JUNK_INDEX {
+                values.resize(JUNK_INDEX + 1, BinaryValue::new(Vec::new()));
+            }
+            if let Some(slot) = values.get_mut(JUNK_INDEX) {
+                *slot = BinaryValue::new(entry_id.clone());
+            }
+            PropertyValue::MultipleBinary(values)
+        } else {
+            PropertyValue::Binary(BinaryValue::new(entry_id.clone()))
+        };
+        properties.retain(|(existing, _)| *existing != id);
+        properties.push((id, value));
+    };
+    let mut updates = Vec::new();
+    if on_store {
+        let mut properties: Vec<_> = store
+            .properties()
+            .iter()
+            .map(|(id, value)| (*id, value.clone()))
+            .collect();
+        set(&mut properties);
+        updates.push((NID_MESSAGE_STORE, properties));
+    } else {
+        for node in recording_folders(&*store)? {
+            let folder = store.open_folder(&store.properties().make_entry_id(node)?)?;
+            let mut properties = writable_folder_properties(folder.as_ref());
+            set(&mut properties);
+            updates.push((node, properties));
+        }
+    }
+    drop(store);
+    rewrite_properties(path, updates)
+}
+
 /// The folders the roles not kept on the store are recorded on: the root folder, the IPM subtree
 /// and, when the file has one, the Inbox.
-fn recording_folders(store: &Rc<UnicodeStore>) -> io::Result<Vec<NodeId>> {
+fn recording_folders(store: &dyn Store) -> io::Result<Vec<NodeId>> {
     let top = store.properties().ipm_sub_tree_entry_id()?.node_id();
     let mut nodes = vec![NID_ROOT_FOLDER, top];
     if let Some(inbox) = find_inbox(store, top)? {
@@ -227,7 +256,7 @@ const INBOX_RECORDS: [u16; 7] = [0x36D0, 0x36D1, 0x36D2, 0x36D3, 0x36D4, 0x36D7,
 /// records the special folders the Inbox records, as Outlook's Inbox does in a file of any
 /// language ("Posteingang", "Boîte de réception"), else the one named Inbox. A folder that doesn't
 /// open is passed over.
-fn find_inbox(store: &Rc<UnicodeStore>, top: NodeId) -> io::Result<Option<NodeId>> {
+fn find_inbox(store: &dyn Store, top: NodeId) -> io::Result<Option<NodeId>> {
     let parent = store.open_folder(&store.properties().make_entry_id(top)?)?;
     let Some(hierarchy) = parent.hierarchy_table() else {
         return Ok(None);
@@ -258,7 +287,7 @@ fn find_inbox(store: &Rc<UnicodeStore>, top: NodeId) -> io::Result<Option<NodeId
 ///
 /// MailCraft: each folder is looked through once, so a damaged hierarchy that lists a folder
 /// under itself, or twice, costs one look per folder, not one per path to it.
-fn folder_names(store: &Rc<UnicodeStore>, node: NodeId) -> io::Result<Option<Vec<String>>> {
+fn folder_names(store: &dyn Store, node: NodeId) -> io::Result<Option<Vec<String>>> {
     let top = store.properties().ipm_sub_tree_entry_id()?.node_id();
     if node == top {
         return Ok(None);
@@ -304,13 +333,14 @@ fn rewrite_properties(
     updates: Vec<(NodeId, Vec<(u16, PropertyValue)>)>,
 ) -> io::Result<()> {
     let mut file = OpenOptions::new().read(true).write(true).open(path)?;
-    let header = UnicodeHeader::read(&mut file)?;
-    let old_root = header.root().clone();
-    let old_bbt = read_block_btree(&mut file, *old_root.block_btree())?;
-    let old_nbt = read_node_btree(&mut file, *old_root.node_btree())?;
+    let header = FileHeader::read(&mut file)?;
+    // MailCraft: an ANSI file's too, its values widened.
+    let format = header.format();
+    let old_bbt = read_block_btree(&mut file, format, header.block_btree())?;
+    let old_nbt = read_node_btree(&mut file, format, header.node_btree())?;
     let bbt_entries = old_bbt.entries();
     let mut nbt_entries = old_nbt.entries();
-    let mut next_bid = header.next_block().index().max(
+    let mut next_bid = header.next_block_index().max(
         bbt_entries
             .iter()
             .map(|entry| entry.block().block().index())
@@ -318,7 +348,7 @@ fn rewrite_properties(
             .unwrap_or(0)
             .saturating_add(1),
     );
-    let mut next_offset = FileSpace::read(&mut file, &old_root, &old_bbt, &old_nbt)?;
+    let mut next_offset = FileSpace::read(&mut file, &header, &old_bbt, &old_nbt)?;
     let mut blocks = Vec::new();
     for (node, properties) in updates {
         let entry = nbt_entries
@@ -327,7 +357,7 @@ fn rewrite_properties(
             .copied()
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "folder node not found"))?;
         let mut subnodes =
-            collect_subnode_entries(&mut file, *old_root.block_btree(), entry.sub_node())?;
+            collect_subnode_entries(&mut file, format, header.block_btree(), entry.sub_node())?;
         let next_subnode = subnodes
             .iter()
             .filter(|entry| matches!(entry.node().id_type(), Ok(NodeIdType::Internal)))
@@ -336,7 +366,7 @@ fn rewrite_properties(
             .unwrap_or(0)
             .checked_add(1)
             .ok_or(PstError::IntegerConversion)?;
-        let (pages, external) = property_context_pages(properties, next_subnode)?;
+        let (pages, external) = property_context_pages(properties, next_subnode, format.text())?;
         let data = push_data_tree_chunks(&mut blocks, &mut next_bid, &mut next_offset, pages)?;
         for (subnode, value) in external {
             let value = push_data_tree(&mut blocks, &mut next_bid, &mut next_offset, &value)?;

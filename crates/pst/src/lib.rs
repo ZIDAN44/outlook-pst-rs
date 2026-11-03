@@ -376,6 +376,7 @@ impl UnicodePstFile {
     /// Set the store display name (PR_DISPLAY_NAME of the message store) of an existing
     /// Unicode PST. Outlook shows it as the top-level name when the file is opened.
     pub fn set_store_display_name(path: impl AsRef<Path>, name: &str) -> io::Result<Self> {
+        expect_format(path.as_ref(), Format::Unicode)?;
         set_unicode_store_display_name(path.as_ref(), name)?;
         Self::open(path)
     }
@@ -383,6 +384,7 @@ impl UnicodePstFile {
     /// Append one message to the default receive folder (normally Inbox) of an
     /// existing Unicode PST, unencoded or permute- or cyclic-encoded.
     pub fn append(path: impl AsRef<Path>, message: &UnicodePstMessage<'_>) -> io::Result<Self> {
+        expect_format(path.as_ref(), Format::Unicode)?;
         append_unicode_pst(
             path.as_ref(),
             &[UnicodePstBatchMessage {
@@ -401,6 +403,7 @@ impl UnicodePstFile {
         message: &UnicodePstMessage<'_>,
         attachments: &[UnicodePstAttachment<'_>],
     ) -> io::Result<Self> {
+        expect_format(path.as_ref(), Format::Unicode)?;
         append_unicode_pst(
             path.as_ref(),
             &[UnicodePstBatchMessage {
@@ -425,6 +428,7 @@ impl UnicodePstFile {
                 attachments: &[],
             })
             .collect::<Vec<_>>();
+        expect_format(path.as_ref(), Format::Unicode)?;
         append_unicode_pst(path.as_ref(), &messages, None)?;
         Self::open(path)
     }
@@ -435,6 +439,7 @@ impl UnicodePstFile {
         path: impl AsRef<Path>,
         messages: &[UnicodePstBatchMessage<'_>],
     ) -> io::Result<Self> {
+        expect_format(path.as_ref(), Format::Unicode)?;
         append_unicode_pst(path.as_ref(), messages, None)?;
         Self::open(path)
     }
@@ -446,6 +451,7 @@ impl UnicodePstFile {
         folder_path: &[&str],
         message: &UnicodePstMessage<'_>,
     ) -> io::Result<Self> {
+        expect_format(path.as_ref(), Format::Unicode)?;
         append_unicode_pst(
             path.as_ref(),
             &[UnicodePstBatchMessage {
@@ -464,6 +470,7 @@ impl UnicodePstFile {
         message: &UnicodePstMessage<'_>,
         attachments: &[UnicodePstAttachment<'_>],
     ) -> io::Result<Self> {
+        expect_format(path.as_ref(), Format::Unicode)?;
         append_unicode_pst(
             path.as_ref(),
             &[UnicodePstBatchMessage {
@@ -489,6 +496,7 @@ impl UnicodePstFile {
                 attachments: &[],
             })
             .collect::<Vec<_>>();
+        expect_format(path.as_ref(), Format::Unicode)?;
         append_unicode_pst(path.as_ref(), &messages, Some(folder_path))?;
         Self::open(path)
     }
@@ -500,6 +508,7 @@ impl UnicodePstFile {
         folder_path: &[&str],
         messages: &[UnicodePstBatchMessage<'_>],
     ) -> io::Result<Self> {
+        expect_format(path.as_ref(), Format::Unicode)?;
         append_unicode_pst(path.as_ref(), messages, Some(folder_path))?;
         Self::open(path)
     }
@@ -1046,9 +1055,12 @@ fn build_property_tree(
     heap.alloc(header)
 }
 
+/// A property context's heap pages and the values kept in subnodes of its own. MailCraft: a
+/// string is written as `text` says (8-bit in an ANSI file, MS-PST 2.5).
 fn property_context_pages(
     properties: impl IntoIterator<Item = (u16, PropertyValue)>,
     mut next_subnode_index: u32,
+    text: Text,
 ) -> io::Result<RebuiltPropertyContext> {
     let mut heap = HeapBuilder::new();
     let mut external = Vec::new();
@@ -1056,6 +1068,7 @@ fn property_context_pages(
         .into_iter()
         .filter(|(_, value)| !matches!(value, PropertyValue::Null))
         .map(|(id, value)| {
+            let value = text.narrow(value);
             let prop_type = PropertyType::from(&value);
             let record = if let Some(small) = small_property_record(&value) {
                 PropertyValueRecord::Small(small)
@@ -1208,7 +1221,7 @@ fn encode_table_row(
     Ok(row)
 }
 
-fn build_row_index<T>(heap: &mut HeapBuilder, rows: &[T]) -> io::Result<HeapId>
+fn build_row_index<T>(heap: &mut HeapBuilder, rows: &[T], format: Format) -> io::Result<HeapId>
 where
     T: Copy,
     u32: From<T>,
@@ -1217,28 +1230,47 @@ where
         .chunks(ROW_INDEX_FANOUT)
         .enumerate()
         .map(|(chunk_index, chunk)| {
-            let mut data = Vec::with_capacity(chunk.len() * 8);
+            let mut data = Vec::with_capacity(chunk.len() * row_index_record_size(format));
             for (index, row) in chunk.iter().enumerate() {
                 TableRowId::new(u32::from(*row)).write(&mut data)?;
-                data.write_u32::<byteorder::LittleEndian>(
-                    u32::try_from(chunk_index * ROW_INDEX_FANOUT + index)
-                        .map_err(|_| PstError::IntegerConversion)?,
-                )?;
+                write_row_number(&mut data, chunk_index * ROW_INDEX_FANOUT + index, format)?;
             }
             Ok((u32::from(chunk[0]), heap.alloc(data)?))
         })
         .collect::<io::Result<Vec<_>>>()?;
-    let header = row_index_header(heap, children, 0)?;
+    let header = row_index_header(heap, children, 0, format)?;
     heap.alloc(header)
 }
 
 const ROW_INDEX_FANOUT: usize = MAX_HN_ALLOCATION_SIZE / 8;
+
+/// MailCraft: the bytes of a row index's leaf record: the row ID and its row number, 32 bits in
+/// a Unicode file and 16 in an ANSI one (MS-PST 2.3.4.3.1).
+fn row_index_record_size(format: Format) -> usize {
+    4 + usize::from(format.row_index_size())
+}
+
+/// MailCraft: a row's number in the row matrix, as the file's format keeps it. An ANSI file's
+/// table holds 2^16 rows at most.
+fn write_row_number(data: &mut Vec<u8>, number: usize, format: Format) -> io::Result<()> {
+    match format {
+        Format::Unicode => data.write_u32::<byteorder::LittleEndian>(
+            u32::try_from(number).map_err(|_| PstError::IntegerConversion)?,
+        ),
+        Format::Ansi => data.write_u16::<byteorder::LittleEndian>(u16::try_from(number).map_err(
+            |_| {
+                io::Error::other("a folder of an ANSI data file (Outlook 97–2002's format) holds 65,536 items at most")
+            },
+        )?),
+    }
+}
 
 /// Stack intermediate levels over `children` (`(first row id, node)`) and encode the BTH header.
 fn row_index_header(
     heap: &mut HeapBuilder,
     mut children: Vec<(u32, HeapId)>,
     mut levels: u8,
+    format: Format,
 ) -> io::Result<Vec<u8>> {
     while children.len() > 1 {
         children = children
@@ -1256,7 +1288,8 @@ fn row_index_header(
     }
     let root = children.first().map(|entry| entry.1).unwrap_or_default();
     let mut header = Vec::new();
-    HeapTreeHeader::new(4, 4, levels, root)?.write(&mut header)?;
+    let entry_size = format.row_index_size();
+    HeapTreeHeader::new(4, entry_size, levels, root)?.write(&mut header)?;
     Ok(header)
 }
 
@@ -1265,12 +1298,19 @@ fn row_index_header(
 fn take_row_index_spine(
     heap: &mut HeapBuilder,
     index: &HeapTreeHeader,
+    format: Format,
 ) -> io::Result<Vec<Vec<u8>>> {
     let mut node = index.root();
     let mut spine = Vec::new();
     for level in (0..=index.levels()).rev() {
         let mut data = heap.free(node)?;
-        if data.is_empty() || data.len() % 8 != 0 {
+        // MailCraft: a leaf's records are as big as the file's format makes them.
+        let record = if level > 0 {
+            8
+        } else {
+            row_index_record_size(format)
+        };
+        if data.is_empty() || data.len() % record != 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "table row index node is malformed",
@@ -1296,25 +1336,30 @@ fn append_row_index_spine(
     mut spine: Vec<Vec<u8>>,
     levels: u8,
     records: &[(u32, u32)],
+    format: Format,
 ) -> io::Result<Vec<u8>> {
     let mut children: Vec<(u32, HeapId)> = Vec::new();
     let mut leaf = true;
     while let Some(mut data) = spine.pop() {
-        if leaf {
+        let record = if leaf {
             for (key, value) in records {
                 data.extend_from_slice(&key.to_le_bytes());
-                data.extend_from_slice(&value.to_le_bytes());
+                let value = usize::try_from(*value).map_err(|_| PstError::IntegerConversion)?;
+                write_row_number(&mut data, value, format)?;
             }
             leaf = false;
-        }
+            row_index_record_size(format)
+        } else {
+            8
+        };
         for (key, child) in children {
             data.extend_from_slice(&key.to_le_bytes());
             data.extend_from_slice(&u32::from(child).to_le_bytes());
         }
         children = data
-            .chunks(ROW_INDEX_FANOUT * 8)
+            .chunks(ROW_INDEX_FANOUT * record)
             .map(|chunk| {
-                // MailCraft: without `unwrap`; every chunk holds whole 8-byte records.
+                // MailCraft: without `unwrap`; every chunk holds whole records.
                 let mut key = [0; 4];
                 key.copy_from_slice(chunk.get(..4).unwrap_or(&[0; 4]));
                 let key = u32::from_le_bytes(key);
@@ -1322,7 +1367,7 @@ fn append_row_index_spine(
             })
             .collect::<io::Result<Vec<_>>>()?;
     }
-    row_index_header(heap, children, levels)
+    row_index_header(heap, children, levels, format)
 }
 
 /// Overwrite fixed-width cells of one row in a subnode row matrix, bumping its row version. Only
@@ -1350,7 +1395,10 @@ fn patch_table_row(
     let (Some(rows_block), Some(position)) = (rows_block, position) else {
         return Ok(None);
     };
-    if !(8..=MAX_DATA_BLOCK_SIZE).contains(&row_size)
+    // MailCraft: a block holds as many rows as its format makes room for (MS-PST 2.3.4.4).
+    let format = next_offset.format;
+    let block_size = format.data_block_size();
+    if !(8..=block_size).contains(&row_size)
         || context
             .rows()
             .is_none_or(|rows| matches!(rows.id_type(), Ok(NodeIdType::HeapNode)))
@@ -1379,12 +1427,12 @@ fn patch_table_row(
         ));
     }
 
-    let mut leaves = data_tree_leaves(file, encoding, bbt_entries, rows_block)?;
-    let rows_per_block = MAX_DATA_BLOCK_SIZE / row_size;
+    let mut leaves = data_tree_leaves(file, format, encoding, bbt_entries, rows_block)?;
+    let rows_per_block = block_size / row_size;
     let Some(&(leaf, _)) = leaves.get(position / rows_per_block) else {
         return Ok(None);
     };
-    let mut data = read_data_block(file, encoding, bbt_entries, leaf)?;
+    let mut data = read_data_block(file, format, encoding, bbt_entries, leaf)?;
     let start = position % rows_per_block * row_size;
     let Some(row_data) = data.get_mut(start..start + row_size) else {
         return Ok(None);
@@ -1420,14 +1468,17 @@ fn patch_table_row(
     )?))
 }
 
-fn string_table_cell(prop_type: PropertyType, value: &str) -> Option<TableCell> {
-    match prop_type {
-        PropertyType::String8 => {
+/// A string's cell in a column of `prop_type`. MailCraft: an 8-bit column takes the string in
+/// the code page `text` says (an ANSI file's), else in UTF-8, as before.
+fn string_table_cell(prop_type: PropertyType, value: &str, text: Text) -> Option<TableCell> {
+    match (prop_type, text) {
+        (PropertyType::String8, Text::Ansi(_)) => Some(TableCell::Bytes(text.bytes(value))),
+        (PropertyType::String8, Text::Unicode) => {
             let mut data = value.as_bytes().to_vec();
             data.push(0);
             Some(TableCell::Bytes(data))
         }
-        PropertyType::Unicode => Some(TableCell::Bytes(utf16_bytes(value))),
+        (PropertyType::Unicode, _) => Some(TableCell::Bytes(utf16_bytes(value))),
         _ => None,
     }
 }
@@ -1454,10 +1505,11 @@ fn recipient_display_table_cell(
     prop_type: PropertyType,
     recipients: &[UnicodePstRecipient<'_>],
     recipient_type: UnicodePstRecipientType,
+    text: Text,
 ) -> Option<TableCell> {
     let display = recipient_display(recipients, recipient_type);
     (!display.is_empty())
-        .then(|| string_table_cell(prop_type, &display))
+        .then(|| string_table_cell(prop_type, &display, text))
         .flatten()
 }
 
@@ -1467,8 +1519,9 @@ fn message_size(
     named: &NamedIds,
     message: NodeId,
     row_version: u32,
+    text: Text,
 ) -> io::Result<i32> {
-    let size = message_bytes(input, attachments, named, message, row_version)?;
+    let size = message_bytes(input, attachments, named, message, row_version, text)?;
     // Outlook excludes the six-byte HN client/root header from message-owned payloads.
     i32::try_from(size.checked_sub(6).ok_or(PstError::IntegerConversion)?)
         .map_err(|_| PstError::IntegerConversion.into())
@@ -1482,19 +1535,21 @@ fn message_bytes(
     named: &NamedIds,
     message: NodeId,
     row_version: u32,
+    text: Text,
 ) -> io::Result<usize> {
     let (message_pages, external) =
-        message_data(input, attachments, named, message, row_version, 0)?;
-    let (recipient_pages, recipient_rows) = recipient_table_data(input.recipients, row_version)?;
+        message_data(input, attachments, named, message, row_version, 0, text)?;
+    let (recipient_pages, recipient_rows) =
+        recipient_table_data(input.recipients, row_version, text)?;
     let attachment_ids = (0..attachments.len())
         .map(|index| {
             let index = u32::try_from(index).map_err(|_| PstError::IntegerConversion)?;
             Ok::<_, io::Error>(NodeId::new(NodeIdType::Attachment, 0x100 + index)?)
         })
         .collect::<io::Result<Vec<_>>>()?;
-    let contents = attachment_contents(attachments, named, row_version)?;
+    let contents = attachment_contents(attachments, named, row_version, text)?;
     let (attachment_pages, attachment_rows) =
-        attachment_table_data(&attachment_ids, attachments, &contents, row_version)?;
+        attachment_table_data(&attachment_ids, attachments, &contents, row_version, text)?;
 
     let mut size = message_pages
         .iter()
@@ -1522,7 +1577,7 @@ fn message_bytes(
             ),
         };
         size = size
-            .checked_add(attachment_data(attachment, data_node, *content, object)?.len())
+            .checked_add(attachment_data(attachment, data_node, *content, object, text)?.len())
             .and_then(|size| size.checked_add(*content))
             .ok_or(PstError::IntegerConversion)?;
     }
@@ -1535,6 +1590,7 @@ fn attachment_contents(
     attachments: &[UnicodePstAttachment<'_>],
     named: &NamedIds,
     row_version: u32,
+    text: Text,
 ) -> io::Result<Vec<usize>> {
     attachments
         .iter()
@@ -1545,6 +1601,7 @@ fn attachment_contents(
                 named,
                 sizing_node()?,
                 row_version,
+                text,
             ),
             None => file_size(attachment),
         })
@@ -1562,10 +1619,11 @@ fn new_message_table_cell(
     message: NodeId,
     row_version: u32,
     message_size: i32,
+    text: Text,
 ) -> io::Result<Option<TableCell>> {
     let prop_type = column.prop_type();
     // MailCraft: an added property's value, as the message has it.
-    if let Some(cell) = added_table_cell(input, named, column)? {
+    if let Some(cell) = added_table_cell(input, named, column, text)? {
         return Ok(cell);
     }
     let cell = match column.prop_id() {
@@ -1575,20 +1633,29 @@ fn new_message_table_cell(
         LTP_ROW_VERSION_PROP_ID if prop_type == PropertyType::Integer32 => Some(TableCell::Value(
             PropertyValue::Integer32(row_version as i32),
         )),
-        0x001A => string_table_cell(prop_type, input.message_class),
-        0x0037 | 0x0E1D | 0x0070 | 0x3001 => string_table_cell(prop_type, input.subject),
-        0x0042 | 0x0C1A => string_table_cell(prop_type, input.sender_name),
-        0x0C1F => string_table_cell(prop_type, input.sender_email),
-        0x0E02 => {
-            recipient_display_table_cell(prop_type, input.recipients, UnicodePstRecipientType::Bcc)
-        }
-        0x0E03 => {
-            recipient_display_table_cell(prop_type, input.recipients, UnicodePstRecipientType::Cc)
-        }
-        0x0E04 => {
-            recipient_display_table_cell(prop_type, input.recipients, UnicodePstRecipientType::To)
-        }
-        0x1035 => string_table_cell(prop_type, input.message_id),
+        0x001A => string_table_cell(prop_type, input.message_class, text),
+        0x0037 | 0x0E1D | 0x0070 | 0x3001 => string_table_cell(prop_type, input.subject, text),
+        0x0042 | 0x0C1A => string_table_cell(prop_type, input.sender_name, text),
+        0x0C1F => string_table_cell(prop_type, input.sender_email, text),
+        0x0E02 => recipient_display_table_cell(
+            prop_type,
+            input.recipients,
+            UnicodePstRecipientType::Bcc,
+            text,
+        ),
+        0x0E03 => recipient_display_table_cell(
+            prop_type,
+            input.recipients,
+            UnicodePstRecipientType::Cc,
+            text,
+        ),
+        0x0E04 => recipient_display_table_cell(
+            prop_type,
+            input.recipients,
+            UnicodePstRecipientType::To,
+            text,
+        ),
+        0x1035 => string_table_cell(prop_type, input.message_id, text),
         0x0039 | 0x0E06 | 0x3008 if prop_type == PropertyType::Time => {
             Some(TableCell::Value(PropertyValue::Time(input.delivery_time)))
         }
@@ -1630,8 +1697,9 @@ fn rebuild_table_with_rows_and_version(
     new_rows: Vec<(NodeId, Vec<Option<TableCell>>)>,
     rows_node: Option<NodeId>,
     row_version: u32,
+    format: Format,
 ) -> io::Result<RebuiltTable> {
-    rebuild_table(table, new_rows, rows_node, row_version, None, false)
+    rebuild_table(table, new_rows, rows_node, row_version, None, false, format)
 }
 
 fn rebuild_table(
@@ -1642,7 +1710,11 @@ fn rebuild_table(
     // MailCraft: a row's cells, any number of them (a folder's content and unread counts).
     property_update: Option<(NodeId, &[(u16, PropertyValue)])>,
     preserve_existing_rows: bool,
+    // MailCraft: the file's format, which says how many rows a block holds and how big a row
+    // index record's row number is.
+    format: Format,
 ) -> io::Result<RebuiltTable> {
+    let block_size = format.data_block_size();
     let old_context = table.context();
     let mut heap = if preserve_existing_rows {
         HeapBuilder::from_pages(table.writer_heap_pages()?)
@@ -1653,17 +1725,17 @@ fn rebuild_table(
     let mut row_chunks: Vec<Vec<u8>> = Vec::new();
     let mut row_ids = Vec::new();
     let push_row = |row_chunks: &mut Vec<Vec<u8>>, row: Vec<u8>| -> io::Result<()> {
-        if row_size == 0 || row_size > MAX_DATA_BLOCK_SIZE {
+        if row_size == 0 || row_size > block_size {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
-                "table rows do not fit in a Unicode PST data block",
+                "table rows do not fit in a PST data block",
             ));
         }
         if row_chunks
             .last()
-            .is_none_or(|chunk| chunk.len() + row_size > MAX_DATA_BLOCK_SIZE)
+            .is_none_or(|chunk| chunk.len() + row_size > block_size)
         {
-            row_chunks.push(Vec::with_capacity(MAX_DATA_BLOCK_SIZE));
+            row_chunks.push(Vec::with_capacity(block_size));
         }
         row_chunks.last_mut().unwrap().extend(row);
         Ok(())
@@ -1734,7 +1806,7 @@ fn rebuild_table(
         row_ids.push(row_id);
     }
 
-    let row_index = build_row_index(&mut heap, &row_ids)?;
+    let row_index = build_row_index(&mut heap, &row_ids, format)?;
     let rows_node = if row_ids.is_empty() {
         None
     } else {
@@ -1772,13 +1844,16 @@ fn new_contents_rows(
     message_sizes: &[i32],
     mut next_subnode_index: u32,
     row_version: u32,
+    // MailCraft: how each message's strings are written.
+    texts: &[Text],
 ) -> io::Result<(NewTableRows, ExternalValues)> {
     let mut external = Vec::new();
     let rows = inputs
         .iter()
         .zip(messages)
         .zip(message_sizes)
-        .map(|((input, message), message_size)| {
+        .zip(texts)
+        .map(|(((input, message), message_size), text)| {
             let mut cells = table
                 .context()
                 .columns()
@@ -1794,6 +1869,7 @@ fn new_contents_rows(
                         *message,
                         row_version,
                         *message_size,
+                        *text,
                     )
                 })
                 .collect::<io::Result<Vec<_>>>()?;
@@ -1840,20 +1916,25 @@ fn bbt_entry(
 /// overflow, and blocks named over and over can't make the list longer than the tree holds.
 fn data_tree_leaves(
     file: &mut File,
+    format: Format,
     encoding: NdbCryptMethod,
     bbt_entries: &[UnicodeBlockBTreeEntry],
     block: UnicodeBlockId,
 ) -> io::Result<Vec<(UnicodeBlockId, u32)>> {
     let entry = bbt_entry(bbt_entries, block)?;
-    let tree = match UnicodeDataTree::read(file, encoding, &entry)? {
-        DataTree::Leaf(_) => return Ok(vec![(block, u32::from(entry.size()))]),
-        DataTree::Intermediate(tree) => tree,
+    let (level, total_size, children) = match read_tree_block(file, format, encoding, &entry)? {
+        TreeBlock::Leaf(_) => return Ok(vec![(block, u32::from(entry.size()))]),
+        TreeBlock::Intermediate {
+            level,
+            total_size,
+            children,
+        } => (level, total_size, children),
     };
-    let mut budget = u64::from(tree.header().total_size());
+    let mut budget = u64::from(total_size);
     let mut leaves = Vec::new();
-    let mut pending = vec![(tree, 0_usize)];
-    while let Some((tree, next)) = pending.last_mut() {
-        let Some(child) = tree.entries().get(*next).map(|entry| entry.block()) else {
+    let mut pending = vec![(level, children, 0_usize)];
+    while let Some((level, children, next)) = pending.last_mut() {
+        let Some(child) = children.get(*next).copied() else {
             pending.pop();
             continue;
         };
@@ -1861,15 +1942,19 @@ fn data_tree_leaves(
         if budget == 0 {
             break;
         }
-        let level = tree.header().level();
+        let level = *level;
         let entry = bbt_entry(bbt_entries, child)?;
-        match UnicodeDataTree::read(file, encoding, &entry)? {
-            DataTree::Leaf(_) if level == 1 => {
+        match read_tree_block(file, format, encoding, &entry)? {
+            TreeBlock::Leaf(_) if level == 1 => {
                 budget = budget.saturating_sub(u64::from(entry.size()));
                 leaves.push((child, u32::from(entry.size())));
             }
-            DataTree::Intermediate(child) if child.header().level() + 1 == level => {
-                pending.push((child, 0_usize));
+            TreeBlock::Intermediate {
+                level: child_level,
+                children,
+                ..
+            } if child_level + 1 == level => {
+                pending.push((child_level, children, 0_usize));
             }
             _ => return Err(NdbError::InvalidInternalBlockLevel(level).into()),
         }
@@ -1879,14 +1964,15 @@ fn data_tree_leaves(
 
 fn read_data_block(
     file: &mut File,
+    format: Format,
     encoding: NdbCryptMethod,
     bbt_entries: &[UnicodeBlockBTreeEntry],
     block: UnicodeBlockId,
 ) -> io::Result<Vec<u8>> {
     let entry = bbt_entry(bbt_entries, block)?;
-    match UnicodeDataTree::read(file, encoding, &entry)? {
-        DataTree::Leaf(block) => Ok(block.data().to_vec()),
-        DataTree::Intermediate(_) => Err(io::Error::new(
+    match read_tree_block(file, format, encoding, &entry)? {
+        TreeBlock::Leaf(data) => Ok(data),
+        TreeBlock::Intermediate { .. } => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "expected a leaf data block",
         )),
@@ -1926,9 +2012,12 @@ fn append_table_rows(
     let Some(rows_block) = rows_block else {
         return Ok(None);
     };
+    // MailCraft: a block holds as many rows as its format makes room for (MS-PST 2.3.4.4).
+    let format = next_offset.format;
+    let block_size = format.data_block_size();
     if old_count == 0
         || !in_order
-        || !(8..=MAX_DATA_BLOCK_SIZE).contains(&row_size)
+        || !(8..=block_size).contains(&row_size)
         || context
             .rows()
             .is_none_or(|rows| matches!(rows.id_type(), Ok(NodeIdType::HeapNode)))
@@ -1939,12 +2028,15 @@ fn append_table_rows(
     let mut heap = HeapBuilder::from_pages(table.writer_heap_pages()?);
     let index_hid = context.row_index();
     let index = HeapTreeHeader::read(&mut heap.get(index_hid)?)?;
-    if index.key_size() != 4 || index.entry_size() != 4 || u32::from(index.root()) == 0 {
+    if index.key_size() != 4
+        || index.entry_size() != format.row_index_size()
+        || u32::from(index.root()) == 0
+    {
         return Ok(None);
     }
-    let heap_leaves = data_tree_leaves(file, encoding, bbt_entries, heap_block)?;
-    let mut row_leaves = data_tree_leaves(file, encoding, bbt_entries, rows_block)?;
-    let rows_per_block = MAX_DATA_BLOCK_SIZE / row_size;
+    let heap_leaves = data_tree_leaves(file, format, encoding, bbt_entries, heap_block)?;
+    let mut row_leaves = data_tree_leaves(file, format, encoding, bbt_entries, rows_block)?;
+    let rows_per_block = block_size / row_size;
     // MailCraft: a row matrix with no blocks, or more than its rows fill, takes the rebuild.
     let Some((tail_block, _)) = row_leaves.pop() else {
         return Ok(None);
@@ -1956,13 +2048,13 @@ fn append_table_rows(
     let Some(tail_rows) = tail_rows.filter(|rows| (1..=rows_per_block).contains(rows)) else {
         return Ok(None);
     };
-    let mut tail = read_data_block(file, encoding, bbt_entries, tail_block)?;
+    let mut tail = read_data_block(file, format, encoding, bbt_entries, tail_block)?;
     if heap_leaves.len() != heap.pages.len() || tail.len() < tail_rows * row_size {
         return Ok(None);
     }
     tail.truncate(tail_rows * row_size);
 
-    let spine = take_row_index_spine(&mut heap, &index)?;
+    let spine = take_row_index_spine(&mut heap, &index, format)?;
     let mut records = Vec::with_capacity(new_rows.len());
     for (row_id, cells) in std::mem::take(new_rows) {
         let row_index =
@@ -1977,7 +2069,7 @@ fn append_table_rows(
         records.push((u32::from(row_id), row_index));
     }
     let row_count = old_count + records.len();
-    let header = append_row_index_spine(&mut heap, spine, index.levels(), &records)?;
+    let header = append_row_index_spine(&mut heap, spine, index.levels(), &records, format)?;
     heap.replace(index_hid, header)?;
 
     let heap_pages = heap.finish_dirty(HeapNodeType::Table, table.writer_heap_user_root()?)?;
@@ -2007,7 +2099,7 @@ fn append_table_rows(
         .collect::<Vec<_>>();
     let last = chunks.len() - 1;
     for chunk in &mut chunks[..last] {
-        chunk.resize(MAX_DATA_BLOCK_SIZE, 0);
+        chunk.resize(block_size, 0);
     }
     for chunk in chunks {
         let size = u32::try_from(chunk.len()).map_err(|_| PstError::IntegerConversion)?;
@@ -2062,7 +2154,7 @@ fn property_context_data_with_nodes(
     finish_heap(allocations, HeapNodeType::Properties, heap_id(1)?)
 }
 
-fn table_context_data(row_ids: &[NodeId]) -> io::Result<Vec<u8>> {
+fn table_context_data(row_ids: &[NodeId], format: Format) -> io::Result<Vec<u8>> {
     let row_index = heap_id(2)?;
     let rows_heap = (!row_ids.is_empty()).then(|| heap_id(4)).transpose()?;
     let columns = vec![
@@ -2087,7 +2179,9 @@ fn table_context_data(row_ids: &[NodeId]) -> io::Result<Vec<u8>> {
     } else {
         heap_id(3)?
     };
-    let tree_header = HeapTreeHeader::new(4, 4, 0, tree_root)?;
+    // MailCraft: a row number is 16 bits in an ANSI file.
+    let entry_size = format.row_index_size();
+    let tree_header = HeapTreeHeader::new(4, entry_size, 0, tree_root)?;
     let mut tree_header_bytes = Vec::new();
     tree_header.write(&mut tree_header_bytes)?;
 
@@ -2096,9 +2190,7 @@ fn table_context_data(row_ids: &[NodeId]) -> io::Result<Vec<u8>> {
     for (index, node_id) in row_ids.iter().enumerate() {
         let row_id = TableRowId::new(u32::from(*node_id));
         row_id.write(&mut index_bytes)?;
-        index_bytes.write_u32::<byteorder::LittleEndian>(
-            u32::try_from(index).map_err(|_| PstError::IntegerConversion)?,
-        )?;
+        write_row_number(&mut index_bytes, index, format)?;
 
         rows.write_u32::<byteorder::LittleEndian>(u32::from(*node_id))?;
         rows.write_u32::<byteorder::LittleEndian>(0)?;
@@ -2148,20 +2240,23 @@ const RECIPIENT_ROW: u16 = RECIPIENT_BOOLEANS + 2 + 3;
 fn recipient_table_data(
     recipients: &[UnicodePstRecipient<'_>],
     row_version: u32,
+    text: Text,
 ) -> io::Result<RebuiltRecipientTable> {
+    // MailCraft: its strings are 8-bit in an ANSI file.
+    let string = text.string_type();
     let columns = vec![
         TableColumnDescriptor::new(PropertyType::Integer32, 0x0C15, 8, 4, 2),
         TableColumnDescriptor::new(PropertyType::Boolean, 0x0E0F, RECIPIENT_BOOLEANS, 1, 3),
         TableColumnDescriptor::new(PropertyType::Binary, 0x0FF9, 12, 4, 4),
         TableColumnDescriptor::new(PropertyType::Integer32, 0x0FFE, 16, 4, 5),
         TableColumnDescriptor::new(PropertyType::Binary, 0x0FFF, 20, 4, 6),
-        TableColumnDescriptor::new(PropertyType::Unicode, 0x3001, 24, 4, 7),
-        TableColumnDescriptor::new(PropertyType::Unicode, 0x3002, 28, 4, 8),
-        TableColumnDescriptor::new(PropertyType::Unicode, 0x3003, 32, 4, 9),
+        TableColumnDescriptor::new(string, 0x3001, 24, 4, 7),
+        TableColumnDescriptor::new(string, 0x3002, 28, 4, 8),
+        TableColumnDescriptor::new(string, 0x3003, 32, 4, 9),
         TableColumnDescriptor::new(PropertyType::Binary, 0x300B, 36, 4, 10),
         TableColumnDescriptor::new(PropertyType::Integer32, 0x3900, 40, 4, 11),
-        TableColumnDescriptor::new(PropertyType::Unicode, 0x39FE, 44, 4, 12),
-        TableColumnDescriptor::new(PropertyType::Unicode, 0x39FF, 48, 4, 13),
+        TableColumnDescriptor::new(string, 0x39FE, 44, 4, 12),
+        TableColumnDescriptor::new(string, 0x39FF, 48, 4, 13),
         TableColumnDescriptor::new(PropertyType::Boolean, 0x3A40, RECIPIENT_BOOLEANS + 1, 1, 14),
         // MailCraft: a meeting's organizer and attendees (MS-OXOCAL 2.2.4.10).
         TableColumnDescriptor::new(PropertyType::Integer32, 0x5FFD, 52, 4, 15),
@@ -2211,13 +2306,13 @@ fn recipient_table_data(
                     None,
                     Some(TableCell::Value(PropertyValue::Integer32(6))),
                     Some(TableCell::Bytes(entry_id)),
-                    string_table_cell(PropertyType::Unicode, display_name),
-                    string_table_cell(PropertyType::Unicode, "SMTP"),
-                    string_table_cell(PropertyType::Unicode, recipient.email),
+                    string_table_cell(string, display_name, text),
+                    string_table_cell(string, "SMTP", text),
+                    string_table_cell(string, recipient.email, text),
                     Some(TableCell::Bytes(recipient_search_key(recipient.email))),
                     Some(TableCell::Value(PropertyValue::Integer32(0))),
-                    string_table_cell(PropertyType::Unicode, recipient.email),
-                    string_table_cell(PropertyType::Unicode, display_name),
+                    string_table_cell(string, recipient.email, text),
+                    string_table_cell(string, display_name, text),
                     Some(TableCell::Value(PropertyValue::Boolean(false))),
                     recipient
                         .flags
@@ -2235,7 +2330,7 @@ fn recipient_table_data(
             )
         })
         .collect::<io::Result<Vec<_>>>()?;
-    let row_index = build_row_index(&mut heap, &row_ids)?;
+    let row_index = build_row_index(&mut heap, &row_ids, text.format())?;
     let rows_node = (!rows.is_empty())
         .then(|| NodeId::new(NodeIdType::Internal, 0x80))
         .transpose()?;
@@ -2246,7 +2341,7 @@ fn recipient_table_data(
     context.write(&mut context_bytes)?;
     let user_root = heap.alloc(context_bytes)?;
     let pages = heap.finish(HeapNodeType::Table, user_root)?;
-    let rows_per_block = MAX_DATA_BLOCK_SIZE / usize::from(RECIPIENT_ROW);
+    let rows_per_block = text.format().data_block_size() / usize::from(RECIPIENT_ROW);
     let row_chunks = rows
         .chunks(rows_per_block)
         .map(|chunk| chunk.concat())
@@ -2259,10 +2354,12 @@ fn attachment_table_data(
     attachments: &[UnicodePstAttachment<'_>],
     contents: &[usize],
     row_version: u32,
+    text: Text,
 ) -> io::Result<RebuiltRecipientTable> {
     let columns = vec![
         TableColumnDescriptor::new(PropertyType::Integer32, 0x0E20, 8, 4, 2),
-        TableColumnDescriptor::new(PropertyType::Unicode, 0x3704, 12, 4, 3),
+        // MailCraft: 8-bit in an ANSI file.
+        TableColumnDescriptor::new(text.string_type(), 0x3704, 12, 4, 3),
         TableColumnDescriptor::new(PropertyType::Integer32, 0x3705, 16, 4, 4),
         TableColumnDescriptor::new(PropertyType::Integer32, 0x370B, 20, 4, 5),
         TableColumnDescriptor::new(PropertyType::Integer32, LTP_ROW_ID_PROP_ID, 0, 4, 0),
@@ -2280,7 +2377,7 @@ fn attachment_table_data(
             let (filename, method) = match embedded(attachment) {
                 Some(_) => (None, ATTACH_EMBEDDED_MESSAGE),
                 None => (
-                    string_table_cell(PropertyType::Unicode, attachment.filename),
+                    string_table_cell(text.string_type(), attachment.filename, text),
                     ATTACH_BY_VALUE,
                 ),
             };
@@ -2304,7 +2401,7 @@ fn attachment_table_data(
             )
         })
         .collect::<io::Result<Vec<_>>>()?;
-    let row_index = build_row_index(&mut heap, attachment_ids)?;
+    let row_index = build_row_index(&mut heap, attachment_ids, text.format())?;
     let rows_node = (!rows.is_empty())
         .then(|| NodeId::new(NodeIdType::Internal, 0x80))
         .transpose()?;
@@ -2313,7 +2410,7 @@ fn attachment_table_data(
     context.write(&mut context_bytes)?;
     let user_root = heap.alloc(context_bytes)?;
     let pages = heap.finish(HeapNodeType::Table, user_root)?;
-    let rows_per_block = MAX_DATA_BLOCK_SIZE / 25;
+    let rows_per_block = text.format().data_block_size() / 25;
     let row_chunks = rows
         .chunks(rows_per_block)
         .map(|chunk| chunk.concat())
@@ -2336,10 +2433,12 @@ fn folder_data(
     content_count: usize,
     has_subfolders: bool,
     container_class: &str,
+    text: Text,
 ) -> io::Result<Vec<u8>> {
     let content_count = u32::try_from(content_count).map_err(|_| PstError::IntegerConversion)?;
+    let string = text.string_type();
     property_context_data(&[
-        (0x3001, PropertyType::Unicode, Some(utf16_bytes(name)), 0),
+        (0x3001, string, Some(text.bytes(name)), 0),
         (0x3602, PropertyType::Integer32, None, content_count),
         (0x3603, PropertyType::Integer32, None, 0),
         (
@@ -2348,12 +2447,7 @@ fn folder_data(
             None,
             u32::from(has_subfolders),
         ),
-        (
-            0x3613,
-            PropertyType::Unicode,
-            Some(utf16_bytes(container_class)),
-            0,
-        ),
+        (0x3613, string, Some(text.bytes(container_class)), 0),
     ])
 }
 
@@ -2364,10 +2458,11 @@ fn message_data(
     message: NodeId,
     row_version: u32,
     message_size: i32,
+    text: Text,
 ) -> io::Result<RebuiltPropertyContext> {
     let has_attachments = !attachments.is_empty();
-    let unicode =
-        |value: &str| PropertyValue::Unicode(UnicodeValue::new(value.encode_utf16().collect()));
+    // MailCraft: 8-bit strings in an ANSI file, in the code page the message says.
+    let unicode = |value: &str| text.value(value);
     let mut properties = vec![
         (0x001A, unicode(input.message_class)),
         (0x0037, unicode(input.subject)),
@@ -2418,7 +2513,14 @@ fn message_data(
             PropertyValue::Binary(BinaryValue::new(html.as_bytes().to_vec())),
         ));
     }
-    property_context_pages(with_added(input, named, properties)?, 0x80)
+    let mut properties = with_added(input, named, properties)?;
+    // MailCraft: `PidTagMessageCodepage`, the code page of an ANSI file's message's strings
+    // (MS-OXCMSG 2.2.1.4), whatever was given for it.
+    if let Text::Ansi(page) = text {
+        properties.retain(|(id, _)| *id != 0x3FFD);
+        properties.push((0x3FFD, PropertyValue::Integer32(page.id())));
+    }
+    property_context_pages(properties, 0x80, text)
 }
 
 /// An attachment's property context: `data_node` holds its file, when it has one, and `content`
@@ -2430,8 +2532,11 @@ fn attachment_data(
     data_node: Option<NodeId>,
     content: usize,
     object: Option<NodeId>,
+    text: Text,
 ) -> io::Result<Vec<u8>> {
     let size = attachment_size(input, content)?;
+    // MailCraft: its strings are 8-bit in an ANSI file.
+    let string = text.string_type();
     if let Some(node) = object {
         let mut value = Vec::with_capacity(8);
         node.write(&mut value)?;
@@ -2440,12 +2545,7 @@ fn attachment_data(
         )?;
         let mut properties = vec![
             (0x0E20, PropertyType::Integer32, None, size as u32),
-            (
-                0x3001,
-                PropertyType::Unicode,
-                Some(utf16_bytes(input.filename)),
-                0,
-            ),
+            (0x3001, string, Some(text.bytes(input.filename)), 0),
             (0x3701, PropertyType::Object, Some(value), 0),
             (
                 0x3705,
@@ -2455,47 +2555,27 @@ fn attachment_data(
             ),
             (0x370B, PropertyType::Integer32, None, u32::MAX),
         ];
-        with_attachment_properties(input, &mut properties)?;
+        with_attachment_properties(input, &mut properties, text)?;
         return fitted_attachment(property_context_data(&properties)?);
     }
     let mut properties = vec![
         (0x0E20, PropertyType::Integer32, None, size as u32),
         (0x3701, PropertyType::Binary, None, 0),
-        (
-            0x3704,
-            PropertyType::Unicode,
-            Some(utf16_bytes(input.filename)),
-            0,
-        ),
+        (0x3704, string, Some(text.bytes(input.filename)), 0),
         (0x3705, PropertyType::Integer32, None, 1),
-        (
-            0x3707,
-            PropertyType::Unicode,
-            Some(utf16_bytes(input.filename)),
-            0,
-        ),
+        (0x3707, string, Some(text.bytes(input.filename)), 0),
         (0x370B, PropertyType::Integer32, None, u32::MAX),
-        (
-            0x370E,
-            PropertyType::Unicode,
-            Some(utf16_bytes(input.mime_type)),
-            0,
-        ),
+        (0x370E, string, Some(text.bytes(input.mime_type)), 0),
     ];
     if let Some(content_id) = attachment_content_id(input)? {
         properties.extend([
-            (
-                0x3712,
-                PropertyType::Unicode,
-                Some(utf16_bytes(content_id)),
-                0,
-            ),
+            (0x3712, string, Some(text.bytes(content_id)), 0),
             // PidTagAttachFlags bit 0x4 marks an attachment as referenced by HTML.
             (0x3714, PropertyType::Integer32, None, 0x0000_0004),
         ]);
     }
     // MailCraft: its own added properties.
-    with_attachment_properties(input, &mut properties)?;
+    with_attachment_properties(input, &mut properties, text)?;
     fitted_attachment(property_context_data_with_nodes(
         &properties,
         &data_node.map(|node| [(0x3701, node)]).unwrap_or_default(),
@@ -2597,7 +2677,7 @@ impl<E: Copy + BTreeEntry<Key = u64>> BTreeLayout<E> {
     fn read(
         file: &mut File,
         root: UnicodePageRef,
-        read_page: fn(&mut File, UnicodePageRef) -> io::Result<BTreePageItems<E>>,
+        read_page: impl Fn(&mut File, UnicodePageRef) -> io::Result<BTreePageItems<E>>,
     ) -> io::Result<Self> {
         let mut layout = Self {
             leaves: Vec::new(),
@@ -2653,55 +2733,21 @@ impl<E: Copy + BTreeEntry<Key = u64>> BTreeLayout<E> {
     }
 }
 
-fn read_block_btree(
-    file: &mut File,
-    root: UnicodePageRef,
-) -> io::Result<BTreeLayout<UnicodeBlockBTreeEntry>> {
-    BTreeLayout::read(file, root, |file, page_ref| {
-        Ok(match UnicodeBlockBTree::read(file, page_ref)? {
-            RootBTreePage::Leaf(page) => BTreePageItems::Leaf(page.entries().to_vec()),
-            RootBTreePage::Intermediate(page, ..) => BTreePageItems::Intermediate(
-                page.level(),
-                page.entries()
-                    .iter()
-                    .map(|entry| (entry.key(), entry.block()))
-                    .collect(),
-            ),
-        })
-    })
-}
-
-fn read_node_btree(
-    file: &mut File,
-    root: UnicodePageRef,
-) -> io::Result<BTreeLayout<UnicodeNodeBTreeEntry>> {
-    BTreeLayout::read(file, root, |file, page_ref| {
-        Ok(match UnicodeNodeBTree::read(file, page_ref)? {
-            RootBTreePage::Leaf(page) => BTreePageItems::Leaf(page.entries().to_vec()),
-            RootBTreePage::Intermediate(page, ..) => BTreePageItems::Intermediate(
-                page.level(),
-                page.entries()
-                    .iter()
-                    .map(|entry| (entry.key(), entry.block()))
-                    .collect(),
-            ),
-        })
-    })
-}
-
 fn collect_block_btree_entries(
     file: &mut File,
+    format: Format,
     page_ref: UnicodePageRef,
 ) -> io::Result<Vec<UnicodeBlockBTreeEntry>> {
-    Ok(read_block_btree(file, page_ref)?.entries())
+    Ok(read_block_btree(file, format, page_ref)?.entries())
 }
 
 #[cfg(test)]
 fn collect_node_btree_entries(
     file: &mut File,
+    format: Format,
     page_ref: UnicodePageRef,
 ) -> io::Result<Vec<UnicodeNodeBTreeEntry>> {
-    Ok(read_node_btree(file, page_ref)?.entries())
+    Ok(read_node_btree(file, format, page_ref)?.entries())
 }
 
 fn reserve_btree_page(
@@ -2712,7 +2758,7 @@ fn reserve_btree_page(
 ) -> io::Result<UnicodePageRef> {
     let id = *next_page;
     *next_page = next_page.next()?;
-    let offset = reserve_file_range(next_offset, PAGE_SIZE as u64, PAGE_SIZE as u64);
+    let offset = reserve_file_range(next_offset, PAGE_SIZE as u64, PAGE_SIZE as u64)?;
     let page_ref = UnicodePageRef::new(id, UnicodeByteIndex::new(offset));
     pages.push(NewBTreePage { page_ref, data });
     Ok(page_ref)
@@ -2780,7 +2826,7 @@ fn plan_btree_level<T: Clone>(
 fn plan_btree<E: Copy + BTreeEntry<Key = u64> + BTreeEntryReadWrite>(
     old: &BTreeLayout<E>,
     entries: &[E],
-    leaf_max: usize,
+    (leaf_max, inner_max): (usize, usize),
     page_type: PageType,
     leaf: fn(Vec<E>) -> NewBTreePageData,
     pages: &mut Vec<NewBTreePage>,
@@ -2807,7 +2853,7 @@ fn plan_btree<E: Copy + BTreeEntry<Key = u64> + BTreeEntryReadWrite>(
         if level > 8 {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
-                "Unicode PST B-tree exceeds eight levels",
+                "PST B-tree exceeds eight levels",
             ));
         }
         let old_level = old
@@ -2819,7 +2865,7 @@ fn plan_btree<E: Copy + BTreeEntry<Key = u64> + BTreeEntryReadWrite>(
             &children,
             |(key, _)| *key,
             |(a_key, a_page), (b_key, b_page)| a_key == b_key && same_page_ref(a_page, b_page),
-            20,
+            inner_max,
             live,
             |chunk| {
                 let entries = chunk
@@ -2839,7 +2885,11 @@ fn plan_btree<E: Copy + BTreeEntry<Key = u64> + BTreeEntryReadWrite>(
     Ok(children[0].1)
 }
 
-fn write_btree_page(file: &mut File, page: NewBTreePage) -> io::Result<()> {
+fn write_btree_page(file: &mut File, format: Format, page: NewBTreePage) -> io::Result<()> {
+    // MailCraft: an ANSI file's pages are its own.
+    if format == Format::Ansi {
+        return write_ansi_btree_page(file, page);
+    }
     let page_type = match &page.data {
         NewBTreePageData::BlockLeaf(_) => PageType::BlockBTree,
         NewBTreePageData::NodeLeaf(_) => PageType::NodeBTree,
@@ -2892,25 +2942,14 @@ fn push_block_with_id(
     id: UnicodeBlockId,
     data: NewBlockData,
 ) -> io::Result<()> {
-    let size = match &data {
-        NewBlockData::Data(data) => u16::try_from(data.len()),
-        NewBlockData::DataTree(entries, ..) => u16::try_from(
-            usize::from(DataTreeBlockHeader::HEADER_SIZE)
-                + entries.len() * usize::from(UnicodeDataTreeEntry::ENTRY_SIZE),
-        ),
-        NewBlockData::SubNodes(entries) => u16::try_from(
-            usize::from(UnicodeSubNodeTreeBlockHeader::HEADER_SIZE)
-                + entries.len() * usize::from(UnicodeLeafSubNodeTreeEntry::ENTRY_SIZE),
-        ),
-        NewBlockData::IntermediateSubNodes(entries, ..) => u16::try_from(
-            usize::from(UnicodeSubNodeTreeBlockHeader::HEADER_SIZE)
-                + entries.len() * usize::from(UnicodeIntermediateSubNodeTreeEntry::ENTRY_SIZE),
-        ),
+    // MailCraft: a block is as big as its format makes it, its trailer too.
+    let format = next_offset.format;
+    let size = format.block_data_size(&data)?;
+    if usize::from(size) > format.data_block_size() {
+        return Err(NdbError::InvalidBlockSize(size).into());
     }
-    .map_err(|_| PstError::IntegerConversion)?;
-    UnicodeBlockTrailer::new(size, 0, 0, id)?;
-    let disk_size = u64::from(ndb::block::block_size(size + UnicodeBlockTrailer::SIZE));
-    let offset = reserve_file_range(next_offset, disk_size, 64);
+    let disk_size = u64::from(ndb::block::block_size(size + format.block_trailer_size()));
+    let offset = reserve_file_range(next_offset, disk_size, 64)?;
     blocks.push(NewBlock {
         id,
         offset,
@@ -2937,18 +2976,19 @@ fn map_page_count(amap_index: u64) -> u64 {
 struct FileSpace {
     eof: u64,
     free: Vec<(u64, u64)>,
-}
-
-impl From<u64> for FileSpace {
-    fn from(eof: u64) -> Self {
-        Self {
-            eof,
-            free: Vec::new(),
-        }
-    }
+    /// MailCraft: the file's format, which says how big its blocks are and how far it can grow.
+    format: Format,
 }
 
 impl FileSpace {
+    fn new(eof: u64, format: Format) -> Self {
+        Self {
+            eof,
+            free: Vec::new(),
+            format,
+        }
+    }
+
     /// MailCraft: the allocation map is taken only when every page of it reads as the reader
     /// reads a map page (type, its repeat and CRC, a zero signature and the page's own offset as
     /// its ID) and none of the space it marks free holds a block the block B-tree lists, a page
@@ -2957,37 +2997,29 @@ impl FileSpace {
     /// live ones, and the append succeeded with old mail lost.
     fn read(
         file: &mut File,
-        root: &UnicodeRoot,
+        header: &FileHeader,
         bbt: &BTreeLayout<UnicodeBlockBTreeEntry>,
         nbt: &BTreeLayout<UnicodeNodeBTreeEntry>,
     ) -> io::Result<Self> {
-        let eof = root.file_eof_index().index();
-        if root.amap_is_valid() == AmapStatus::Invalid {
-            return Ok(Self::from(eof));
+        let eof = header.file_eof();
+        let format = header.format();
+        if header.amap_status() == AmapStatus::Invalid {
+            return Ok(Self::new(eof, format));
         }
-        Ok(Self::read_map(file, eof)
+        Ok(Self::read_map(file, eof, format)
             .filter(|space| !space.overlaps_live(bbt, nbt))
-            .unwrap_or_else(|| Self::from(eof)))
+            .unwrap_or_else(|| Self::new(eof, format)))
     }
 
     /// The free space the allocation map marks, or `None` if a page of it doesn't read.
-    fn read_map(file: &mut File, eof: u64) -> Option<Self> {
-        let mut space = Self::from(eof);
+    fn read_map(file: &mut File, eof: u64, format: Format) -> Option<Self> {
+        let mut space = Self::new(eof, format);
         let mut amap = AMAP_FIRST_OFFSET;
         let mut bytes = [0; PAGE_SIZE];
         while amap < space.eof {
             file.seek(SeekFrom::Start(amap)).ok()?;
             file.read_exact(&mut bytes).ok()?;
-            let page =
-                <<UnicodePstFile as PstFile>::AllocationMapPage as AllocationMapPageReadWrite<
-                    UnicodePstFile,
-                >>::read(&mut &bytes[..])
-                .ok()?;
-            let trailer = page.trailer();
-            if trailer.signature() != 0 || u64::from(trailer.block_id()) != amap {
-                return None;
-            }
-            let bits = page.map_bits();
+            let bits = read_map_page(&bytes, format, amap)?;
             for bit in 0..bits.len() * 8 {
                 let offset = amap + bit as u64 * 64;
                 if offset >= space.eof {
@@ -3021,7 +3053,7 @@ impl FileSpace {
                 .get(index)
                 .is_some_and(|&(free_start, _)| free_start < end)
         };
-        let trailer = u64::from(UnicodeBlockTrailer::SIZE);
+        let trailer = u64::from(self.format.block_trailer_size());
         let blocks = bbt
             .leaves
             .iter()
@@ -3055,7 +3087,19 @@ impl FileSpace {
     }
 }
 
-fn reserve_file_range(space: &mut FileSpace, size: u64, alignment: u64) -> u64 {
+/// Where `size` bytes go, aligned to `alignment`. MailCraft: an error past the most a file of
+/// its format can hold (an ANSI file's 2 GB).
+fn reserve_file_range(space: &mut FileSpace, size: u64, alignment: u64) -> io::Result<u64> {
+    let offset = reserve_file_range_unchecked(space, size, alignment);
+    if offset.saturating_add(size) > space.format.max_file_size() {
+        return Err(io::Error::other(
+            "an ANSI data file (Outlook 97–2002's format) can't grow past 2 GB",
+        ));
+    }
+    Ok(offset)
+}
+
+fn reserve_file_range_unchecked(space: &mut FileSpace, size: u64, alignment: u64) -> u64 {
     // ponytail: first-fit linear scan, keep a size index if fragmented files make this hot
     for index in 0..space.free.len() {
         let (start, end) = space.free[index];
@@ -3108,7 +3152,8 @@ fn push_data_tree(
         blocks,
         next_bid,
         next_offset,
-        data.chunks(MAX_DATA_BLOCK_SIZE).map(<[u8]>::to_vec),
+        data.chunks(next_offset.format.data_block_size())
+            .map(<[u8]>::to_vec),
     )
 }
 
@@ -3119,21 +3164,23 @@ fn push_data_tree_chunks(
     chunks: impl IntoIterator<Item = Vec<u8>>,
 ) -> io::Result<UnicodeBlockId> {
     let mut chunks = chunks.into_iter().collect::<Vec<_>>();
+    // MailCraft: the blocks but the last are as big as the file's format makes a block.
+    let block_size = next_offset.format.data_block_size();
     if chunks.is_empty() || chunks.iter().any(Vec::is_empty) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "data tree cannot contain empty blocks",
         ));
     }
-    if chunks.iter().any(|chunk| chunk.len() > MAX_DATA_BLOCK_SIZE) {
+    if chunks.iter().any(|chunk| chunk.len() > block_size) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "data tree block exceeds the Unicode PST block limit",
+            "data tree block exceeds the PST block limit",
         ));
     }
     let intermediate_count = chunks.len().saturating_sub(1);
     for chunk in chunks.iter_mut().take(intermediate_count) {
-        chunk.resize(MAX_DATA_BLOCK_SIZE, 0);
+        chunk.resize(block_size, 0);
     }
     let ids = chunks
         .into_iter()
@@ -3166,9 +3213,11 @@ fn push_data_tree_leaves(
         ));
     }
     let mut level = 1;
+    // MailCraft: as many BIDs as an XBLOCK of the file's format takes.
+    let capacity = next_offset.format.data_tree_capacity();
     while ids.len() > 1 {
         ids = ids
-            .chunks(1021)
+            .chunks(capacity)
             .map(|entries| {
                 let total_size = entries.iter().try_fold(0_u32, |total, (_, size)| {
                     total.checked_add(*size).ok_or(PstError::IntegerConversion)
@@ -3201,8 +3250,9 @@ fn push_recipient_table(
     next_offset: &mut FileSpace,
     recipients: &[UnicodePstRecipient<'_>],
     row_version: u32,
+    text: Text,
 ) -> io::Result<(UnicodeBlockId, Option<UnicodeBlockId>)> {
-    let (pages, rows) = recipient_table_data(recipients, row_version)?;
+    let (pages, rows) = recipient_table_data(recipients, row_version, text)?;
     let data = push_data_tree_chunks(blocks, next_bid, next_offset, pages)?;
     let subnodes = if let Some((rows_node, row_chunks)) = rows {
         let rows = push_data_tree_chunks(blocks, next_bid, next_offset, row_chunks)?;
@@ -3224,12 +3274,9 @@ fn push_subnode_tree(
     next_offset: &mut FileSpace,
     mut entries: Vec<UnicodeLeafSubNodeTreeEntry>,
 ) -> io::Result<UnicodeBlockId> {
-    const LEAF_CAPACITY: usize = (MAX_DATA_BLOCK_SIZE
-        - UnicodeSubNodeTreeBlockHeader::HEADER_SIZE as usize)
-        / UnicodeLeafSubNodeTreeEntry::ENTRY_SIZE as usize;
-    const INTERMEDIATE_CAPACITY: usize = (MAX_DATA_BLOCK_SIZE
-        - UnicodeSubNodeTreeBlockHeader::HEADER_SIZE as usize)
-        / UnicodeIntermediateSubNodeTreeEntry::ENTRY_SIZE as usize;
+    // MailCraft: as many entries as an SLBLOCK and an SIBLOCK of the file's format take.
+    let leaf_capacity = next_offset.format.leaf_sub_node_capacity();
+    let intermediate_capacity = next_offset.format.intermediate_sub_node_capacity();
 
     if entries.is_empty() {
         return Err(io::Error::new(
@@ -3239,7 +3286,7 @@ fn push_subnode_tree(
     }
     entries.sort_by_key(|entry| u32::from(entry.node()));
     let mut level_entries = entries
-        .chunks(LEAF_CAPACITY)
+        .chunks(leaf_capacity)
         .map(|chunk| {
             let first = chunk[0].node();
             let block = push_block(
@@ -3256,7 +3303,7 @@ fn push_subnode_tree(
     let mut level = 1;
     while level_entries.len() > 1 {
         level_entries = level_entries
-            .chunks(INTERMEDIATE_CAPACITY)
+            .chunks(intermediate_capacity)
             .map(|chunk| {
                 let first = chunk[0].0;
                 let entries = chunk
@@ -3285,19 +3332,22 @@ struct BlockWriter {
     base: u64,
     position: u64,
     buffer: Vec<u8>,
-    /// MailCraft: the file's `bCryptMethod`, which its data blocks are encoded with.
+    /// MailCraft: the file's `bCryptMethod`, which its data blocks are encoded with…
     encoding: NdbCryptMethod,
+    /// …and its format.
+    format: Format,
 }
 
 impl BlockWriter {
     const MAX_RUN: usize = 8 << 20;
 
-    fn new(encoding: NdbCryptMethod) -> Self {
+    fn new(encoding: NdbCryptMethod, format: Format) -> Self {
         Self {
             base: 0,
             position: 0,
             buffer: Vec::new(),
             encoding,
+            format,
         }
     }
 
@@ -3310,7 +3360,10 @@ impl BlockWriter {
             self.base = block.offset;
         }
         let encoding = self.encoding;
-        write_new_block(self, encoding, block)
+        match self.format {
+            Format::Unicode => write_new_block(self, encoding, block),
+            Format::Ansi => write_ansi_block(self, encoding, block),
+        }
     }
 
     fn flush(&mut self, file: &mut File) -> io::Result<()> {
@@ -3432,6 +3485,7 @@ fn push_message(
     message_size: i32,
     embedded_ids: &mut EmbeddedIds,
     flush: &mut dyn FnMut(&mut Vec<NewBlock>) -> io::Result<()>,
+    text: Text,
 ) -> io::Result<(UnicodeBlockId, UnicodeBlockId)> {
     let (message_pages, message_properties) = message_data(
         input,
@@ -3440,10 +3494,17 @@ fn push_message(
         message,
         row_version,
         message_size,
+        text,
     )?;
     let message_bid = push_data_tree_chunks(blocks, next_bid, next_offset, message_pages)?;
-    let (recipient_bid, recipient_subnodes) =
-        push_recipient_table(blocks, next_bid, next_offset, input.recipients, row_version)?;
+    let (recipient_bid, recipient_subnodes) = push_recipient_table(
+        blocks,
+        next_bid,
+        next_offset,
+        input.recipients,
+        row_version,
+        text,
+    )?;
     let mut message_subnodes = vec![UnicodeLeafSubNodeTreeEntry::new(
         NID_RECIPIENT_TABLE,
         recipient_bid,
@@ -3463,6 +3524,7 @@ fn push_message(
         &mut message_subnodes,
         embedded_ids,
         flush,
+        text,
     )?;
     let message_subnode_bid = push_subnode_tree(blocks, next_bid, next_offset, message_subnodes)?;
     Ok((message_bid, message_subnode_bid))
@@ -3479,6 +3541,7 @@ fn push_attachments(
     sub_nodes: &mut Vec<UnicodeLeafSubNodeTreeEntry>,
     embedded_ids: &mut EmbeddedIds,
     flush: &mut dyn FnMut(&mut Vec<NewBlock>) -> io::Result<()>,
+    text: Text,
 ) -> io::Result<()> {
     if attachments.is_empty() {
         return Ok(());
@@ -3490,9 +3553,9 @@ fn push_attachments(
             Ok(NodeId::new(NodeIdType::Attachment, 0x100 + index)?)
         })
         .collect::<io::Result<Vec<_>>>()?;
-    let contents = attachment_contents(attachments, named, row_version)?;
+    let contents = attachment_contents(attachments, named, row_version, text)?;
     let (table_pages, table_rows) =
-        attachment_table_data(&attachment_ids, attachments, &contents, row_version)?;
+        attachment_table_data(&attachment_ids, attachments, &contents, row_version, text)?;
     let table_block = push_data_tree_chunks(blocks, next_bid, next_offset, table_pages)?;
     let table_subnodes = if let Some((rows_node, rows)) = table_rows {
         let rows = push_data_tree_chunks(blocks, next_bid, next_offset, rows)?;
@@ -3538,6 +3601,7 @@ fn push_attachments(
                 size,
                 embedded_ids,
                 flush,
+                text,
             )?;
             let tree = push_block(
                 blocks,
@@ -3580,7 +3644,9 @@ fn push_attachments(
             next_bid,
             next_offset,
             false,
-            NewBlockData::Data(attachment_data(attachment, data_node, *content, object)?),
+            NewBlockData::Data(attachment_data(
+                attachment, data_node, *content, object, text,
+            )?),
         )?;
         sub_nodes.push(UnicodeLeafSubNodeTreeEntry::new(
             attachment_id,
@@ -3603,30 +3669,16 @@ thread_local! {
         const { std::cell::Cell::new(None) };
 }
 
-/// MailCraft: every file the writer reads to add to it is opened here, with the limit set.
-fn open_to_add(path: &Path) -> io::Result<UnicodePstFile> {
-    let pst = UnicodePstFile::open(path)?;
+/// MailCraft: the limit every file the writer reads to add to it is opened with
+/// ([`AddStore::open`]).
+fn add_max_value_size() -> u64 {
     #[cfg(test)]
     let limit = TEST_ADD_MAX_VALUE_SIZE
         .with(std::cell::Cell::get)
         .unwrap_or(ADD_MAX_VALUE_SIZE);
     #[cfg(not(test))]
     let limit = ADD_MAX_VALUE_SIZE;
-    pst.set_max_value_size(limit);
-    Ok(pst)
-}
-
-fn finish_unicode_pst_metadata(
-    path: &Path,
-    blocks: &[(u64, u16)],
-    pages: &[u64],
-) -> io::Result<()> {
-    let mut pst = open_to_add(path)?;
-    pst.inner
-        .rebuild_allocation_map_from(Some((blocks, pages)))?;
-    pst.inner.ensure_density_list()?;
-    pst.inner.finish_write()?;
-    Ok(())
+    limit
 }
 
 fn create_unicode_pst(
@@ -3668,7 +3720,8 @@ fn create_empty_unicode_pst(path: &Path) -> io::Result<()> {
 
         file.seek(SeekFrom::Start(0))?;
         let mut header = UnicodeHeader::read(&mut file)?;
-        let entries = collect_block_btree_entries(&mut file, *header.root().block_btree())?;
+        let entries =
+            collect_block_btree_entries(&mut file, Format::Unicode, *header.root().block_btree())?;
         for entry in entries
             .iter()
             .filter(|entry| !entry.block().block().is_internal())
@@ -3701,7 +3754,7 @@ fn create_empty_unicode_pst(path: &Path) -> io::Result<()> {
     Ok(())
 }
 fn default_receive_folder(
-    store: &Rc<UnicodeStore>,
+    store: &AddStore,
     nbt_entries: &[UnicodeNodeBTreeEntry],
 ) -> io::Result<NodeId> {
     let ipm = store.open_folder(&store.properties().ipm_sub_tree_entry_id()?)?;
@@ -3725,7 +3778,7 @@ fn default_receive_folder(
         .iter()
         .filter(|entry| matches!(entry.node().id_type(), Ok(NodeIdType::ReceiveFolderTable)))
     {
-        let Ok(table) = UnicodeTableContext::read(store.clone(), *entry) else {
+        let Ok(table) = store.table(*entry) else {
             continue;
         };
         for row in table.rows_matrix() {
@@ -3790,11 +3843,7 @@ fn default_receive_folder(
     ))
 }
 
-fn find_child_folder(
-    store: &Rc<UnicodeStore>,
-    parent: NodeId,
-    name: &str,
-) -> io::Result<Option<NodeId>> {
+fn find_child_folder(store: &dyn Store, parent: NodeId, name: &str) -> io::Result<Option<NodeId>> {
     let parent = store.open_folder(&store.properties().make_entry_id(parent)?)?;
     let Some(hierarchy) = parent.hierarchy_table() else {
         return Ok(None);
@@ -3823,6 +3872,8 @@ fn new_folder_table_cell(
     row_version: u32,
 ) -> io::Result<Option<TableCell>> {
     let prop_type = column.prop_type();
+    // MailCraft: a folder's names are 8-bit in an ANSI file's 8-bit columns.
+    let text = Format::Ansi.text();
     let cell = match column.prop_id() {
         LTP_ROW_ID_PROP_ID if prop_type == PropertyType::Integer32 => Some(TableCell::Value(
             PropertyValue::Integer32(u32::from(folder) as i32),
@@ -3830,14 +3881,14 @@ fn new_folder_table_cell(
         LTP_ROW_VERSION_PROP_ID if prop_type == PropertyType::Integer32 => Some(TableCell::Value(
             PropertyValue::Integer32(row_version as i32),
         )),
-        0x3001 => string_table_cell(prop_type, name),
+        0x3001 => string_table_cell(prop_type, name, text),
         0x3602 | 0x3603 if prop_type == PropertyType::Integer32 => {
             Some(TableCell::Value(PropertyValue::Integer32(0)))
         }
         0x360A if prop_type == PropertyType::Boolean => {
             Some(TableCell::Value(PropertyValue::Boolean(has_subfolders)))
         }
-        0x3613 => string_table_cell(prop_type, container_class),
+        0x3613 => string_table_cell(prop_type, container_class, text),
         0x0FFF if prop_type == PropertyType::Binary => {
             let entry_id = EntryId::new(StoreRecordKey::new(store_record_key), folder);
             Some(TableCell::Bytes(Vec::try_from(&entry_id)?))
@@ -3857,6 +3908,7 @@ fn rebuild_hierarchy_table(
     has_subfolders: bool,
     rows_node: NodeId,
     row_version: u32,
+    format: Format,
 ) -> io::Result<RebuiltTable> {
     let cells = table
         .context()
@@ -3881,6 +3933,7 @@ fn rebuild_hierarchy_table(
         row_version,
         None,
         true,
+        format,
     )
 }
 
@@ -3931,21 +3984,6 @@ fn set_folder_boolean_property(properties: &mut Vec<(u16, PropertyValue)>, id: u
     }
 }
 
-fn collect_subnode_entries(
-    file: &mut File,
-    bbt_ref: UnicodePageRef,
-    subnode: Option<UnicodeBlockId>,
-) -> io::Result<Vec<UnicodeLeafSubNodeTreeEntry>> {
-    let Some(subnode) = subnode else {
-        return Ok(Vec::new());
-    };
-    let bbt = UnicodeBlockBTree::read(file, bbt_ref)?;
-    let mut cache = Default::default();
-    let block = bbt.find_entry(file, subnode.search_key(), &mut cache)?;
-    let tree = SubNodeTree::<UnicodePstFile>::read(file, &block)?;
-    Ok(tree.entries(file, &bbt, &mut cache)?.collect())
-}
-
 fn write_pending_blocks(
     file: &mut File,
     writer: &mut BlockWriter,
@@ -3965,7 +4003,7 @@ fn write_pending_blocks(
 }
 
 fn append_search_updates(
-    store: &Rc<UnicodeStore>,
+    store: &dyn Store,
     nbt_entries: &mut Vec<UnicodeNodeBTreeEntry>,
     blocks: &mut Vec<NewBlock>,
     next_bid: &mut u64,
@@ -4019,6 +4057,7 @@ fn record_block_reference(
 
 fn internal_block_children(
     file: &mut File,
+    format: Format,
     entry: &UnicodeBlockBTreeEntry,
 ) -> io::Result<Vec<UnicodeBlockId>> {
     file.seek(SeekFrom::Start(entry.block().index().index()))?;
@@ -4026,19 +4065,14 @@ fn internal_block_children(
     file.read_exact(&mut block_type)?;
     Ok(match block_type[0] {
         // Internal blocks (XBLOCKs, SLBLOCKs, SIBLOCKs) are never encoded (MS-PST 5.1, 5.2).
-        0x01 => match UnicodeDataTree::read(file, NdbCryptMethod::None, entry)? {
-            DataTree::Intermediate(tree) => {
-                tree.entries().iter().map(|entry| entry.block()).collect()
-            }
+        0x01 => match read_tree_block(file, format, NdbCryptMethod::None, entry)? {
+            TreeBlock::Intermediate { children, .. } => children,
             // MailCraft: an error rather than `unreachable!` (a leaf's ID is never internal).
-            DataTree::Leaf(_) => return Err(NdbError::InvalidInternalBlockType(0x01).into()),
+            TreeBlock::Leaf(_) => return Err(NdbError::InvalidInternalBlockType(0x01).into()),
         },
-        0x02 => match UnicodeSubNodeTree::read(file, entry)? {
-            SubNodeTree::Intermediate(tree) => {
-                tree.entries().iter().map(|entry| entry.block()).collect()
-            }
-            SubNodeTree::Leaf(tree) => tree
-                .entries()
+        0x02 => match read_sub_node_block(file, format, entry)? {
+            SubNodeBlock::Intermediate(children) => children,
+            SubNodeBlock::Leaf(entries) => entries
                 .iter()
                 .flat_map(|entry| [Some(entry.block()), entry.sub_node()])
                 .flatten()
@@ -4054,6 +4088,7 @@ fn internal_block_children(
 /// caller can fall back to [`compact_unicode_block_tree`].
 fn update_block_ref_counts(
     file: &mut File,
+    format: Format,
     old_blocks: &[UnicodeBlockBTreeEntry],
     old_nodes: &[UnicodeNodeBTreeEntry],
     entries: &mut Vec<UnicodeBlockBTreeEntry>,
@@ -4104,7 +4139,7 @@ fn update_block_ref_counts(
     };
     for entry in entries.iter() {
         if entry.block().block().is_internal() && !is_old(entry.key()) {
-            for child in internal_block_children(file, entry)? {
+            for child in internal_block_children(file, format, entry)? {
                 add(&mut delta, Some(child), 1);
             }
         }
@@ -4122,7 +4157,7 @@ fn update_block_ref_counts(
         }
         if count == 1 && entries[index].block().block().is_internal() && released.insert(key) {
             let entry = entries[index];
-            for child in internal_block_children(file, &entry)? {
+            for child in internal_block_children(file, format, &entry)? {
                 add(&mut delta, Some(child), -1);
                 pending.push(child.search_key());
             }
@@ -4145,6 +4180,7 @@ fn update_block_ref_counts(
 
 fn compact_unicode_block_tree(
     file: &mut File,
+    format: Format,
     entries: &mut Vec<UnicodeBlockBTreeEntry>,
     nodes: &[UnicodeNodeBTreeEntry],
 ) -> io::Result<()> {
@@ -4173,7 +4209,7 @@ fn compact_unicode_block_tree(
         if !block.is_internal() {
             continue;
         }
-        for child in internal_block_children(file, &entry)? {
+        for child in internal_block_children(file, format, &entry)? {
             record_block_reference(child, &mut references, &mut pending)?;
         }
     }
@@ -4195,7 +4231,7 @@ fn compact_unicode_block_tree(
 fn commit_unicode_changes(
     path: &Path,
     mut file: File,
-    mut header: UnicodeHeader,
+    mut header: FileHeader,
     old_bbt: &BTreeLayout<UnicodeBlockBTreeEntry>,
     old_nbt: &BTreeLayout<UnicodeNodeBTreeEntry>,
     mut bbt_entries: Vec<UnicodeBlockBTreeEntry>,
@@ -4216,9 +4252,10 @@ fn commit_unicode_changes(
     // New blocks and pages only go to space the committed allocation map marks free, so the
     // committed state stays intact until the header switches roots: one barrier before that
     // switch and one after it (the allocation map is invalid until it is rebuilt) suffice.
-    header.root_mut().set_amap_status(AmapStatus::Invalid);
+    let format = header.format();
+    header.set_amap_status(AmapStatus::Invalid);
     header.update_unique();
-    let mut writer = BlockWriter::new(header.crypt_method());
+    let mut writer = BlockWriter::new(header.crypt_method(), format);
     for block in blocks {
         writer.push(&mut file, block)?;
     }
@@ -4227,17 +4264,18 @@ fn commit_unicode_changes(
     let before = bbt_entries.clone();
     if !update_block_ref_counts(
         &mut file,
+        format,
         &old_bbt.entries(),
         &old_nbt.entries(),
         &mut bbt_entries,
         &nbt_entries,
     )? {
-        compact_unicode_block_tree(&mut file, &mut bbt_entries, &nbt_entries)?;
+        compact_unicode_block_tree(&mut file, format, &mut bbt_entries, &nbt_entries)?;
     }
     #[cfg(test)]
     {
         let mut full = before;
-        compact_unicode_block_tree(&mut file, &mut full, &nbt_entries)?;
+        compact_unicode_block_tree(&mut file, format, &mut full, &nbt_entries)?;
         let counts = |entries: &[UnicodeBlockBTreeEntry]| {
             entries
                 .iter()
@@ -4254,10 +4292,12 @@ fn commit_unicode_changes(
     let mut pages = Vec::new();
     let mut next_page = header.next_page();
     let mut live_pages = Vec::new();
+    // MailCraft: as many entries as a page of the file's format holds.
+    let (block_max, node_max, inner_max) = format.btree_capacity();
     let bbt_ref = plan_btree(
         old_bbt,
         &bbt_entries,
-        20,
+        (block_max, inner_max),
         PageType::BlockBTree,
         NewBTreePageData::BlockLeaf,
         &mut pages,
@@ -4268,7 +4308,7 @@ fn commit_unicode_changes(
     let nbt_ref = plan_btree(
         old_nbt,
         &nbt_entries,
-        15,
+        (node_max, inner_max),
         PageType::NodeBTree,
         NewBTreePageData::NodeLeaf,
         &mut pages,
@@ -4282,25 +4322,19 @@ fn commit_unicode_changes(
         + (new_eof.saturating_sub(AMAP_FIRST_OFFSET + 1) / AMAP_DATA_SIZE) * AMAP_DATA_SIZE;
 
     for page in pages {
-        write_btree_page(&mut file, page)?;
+        write_btree_page(&mut file, format, page)?;
     }
     file.set_len(new_eof)?;
     file.sync_data()?;
 
-    header.set_next_block(UnicodeBlockId::new(false, next_bid)?);
-    header.set_next_page(next_page);
+    header.set_next_block(next_bid)?;
+    header.set_next_page(next_page)?;
     for node in reserved_nodes {
         header.reserve_node(*node)?;
     }
-    header.root_mut().set_btrees(nbt_ref, bbt_ref);
-    header
-        .root_mut()
-        .set_file_eof_index(UnicodeByteIndex::new(new_eof));
-    header
-        .root_mut()
-        .set_amap_last_index(UnicodeByteIndex::new(amap_last));
+    header.set_btrees(nbt_ref, bbt_ref)?;
+    header.set_file_eof(new_eof, amap_last)?;
     header.update_unique();
-    file.seek(SeekFrom::Start(0))?;
     header.write(&mut file)?;
     file.sync_data()?;
     drop(file);
@@ -4308,7 +4342,7 @@ fn commit_unicode_changes(
         .iter()
         .map(|entry| (entry.block().index().index(), entry.size()))
         .collect::<Vec<_>>();
-    finish_unicode_pst_metadata(path, &blocks, &live_pages)
+    finish_metadata(path, &blocks, &live_pages)
 }
 
 fn set_unicode_store_display_name(path: &Path, name: &str) -> io::Result<()> {
@@ -4320,10 +4354,11 @@ fn set_unicode_store_display_name(path: &Path, name: &str) -> io::Result<()> {
     }
     let mut file = OpenOptions::new().read(true).write(true).open(path)?;
     // MailCraft: an encoded file is renamed too; its new blocks are encoded like the rest.
-    let header = UnicodeHeader::read(&mut file)?;
-    let old_root = header.root().clone();
-    let old_bbt = read_block_btree(&mut file, *old_root.block_btree())?;
-    let old_nbt = read_node_btree(&mut file, *old_root.node_btree())?;
+    let header = FileHeader::read(&mut file)?;
+    // MailCraft: an ANSI file's too, its values widened.
+    let format = header.format();
+    let old_bbt = read_block_btree(&mut file, format, header.block_btree())?;
+    let old_nbt = read_node_btree(&mut file, format, header.node_btree())?;
     let bbt_entries = old_bbt.entries();
     let mut nbt_entries = old_nbt.entries();
     let store_entry = nbt_entries
@@ -4331,19 +4366,16 @@ fn set_unicode_store_display_name(path: &Path, name: &str) -> io::Result<()> {
         .find(|entry| entry.node() == NID_MESSAGE_STORE)
         .copied()
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "message store node not found"))?;
-    let store = UnicodeStore::read(Rc::new(open_to_add(path)?))?;
+    let store = AddStore::open(path)?;
     let mut properties: Vec<_> = store
         .properties()
         .iter()
         .filter(|(id, _)| **id != 0x3001)
         .map(|(id, value)| (*id, value.clone()))
         .collect();
-    properties.push((
-        0x3001,
-        PropertyValue::Unicode(UnicodeValue::new(name.encode_utf16().collect())),
-    ));
+    properties.push((0x3001, format.text().value(name)));
 
-    let mut next_bid = header.next_block().index().max(
+    let mut next_bid = header.next_block_index().max(
         bbt_entries
             .iter()
             .map(|entry| entry.block().block().index())
@@ -4351,10 +4383,14 @@ fn set_unicode_store_display_name(path: &Path, name: &str) -> io::Result<()> {
             .unwrap_or(0)
             .saturating_add(1),
     );
-    let mut next_offset = FileSpace::read(&mut file, &old_root, &old_bbt, &old_nbt)?;
+    let mut next_offset = FileSpace::read(&mut file, &header, &old_bbt, &old_nbt)?;
     let mut blocks = Vec::new();
-    let mut subnodes =
-        collect_subnode_entries(&mut file, *old_root.block_btree(), store_entry.sub_node())?;
+    let mut subnodes = collect_subnode_entries(
+        &mut file,
+        format,
+        header.block_btree(),
+        store_entry.sub_node(),
+    )?;
     let next_property_subnode = subnodes
         .iter()
         .filter(|entry| matches!(entry.node().id_type(), Ok(NodeIdType::Internal)))
@@ -4363,7 +4399,8 @@ fn set_unicode_store_display_name(path: &Path, name: &str) -> io::Result<()> {
         .unwrap_or(0)
         .checked_add(1)
         .ok_or(PstError::IntegerConversion)?;
-    let (pages, external_properties) = property_context_pages(properties, next_property_subnode)?;
+    let (pages, external_properties) =
+        property_context_pages(properties, next_property_subnode, format.text())?;
     let data = push_data_tree_chunks(&mut blocks, &mut next_bid, &mut next_offset, pages)?;
     for (node, value) in external_properties {
         let value = push_data_tree(&mut blocks, &mut next_bid, &mut next_offset, &value)?;
@@ -4411,14 +4448,14 @@ fn create_unicode_folder(
     let mut file = OpenOptions::new().read(true).write(true).open(path)?;
     // MailCraft: folders are made in an encoded file too; its new blocks are encoded like the
     // rest.
-    let header = UnicodeHeader::read(&mut file)?;
-    let old_root = header.root().clone();
-    let old_bbt = read_block_btree(&mut file, *old_root.block_btree())?;
-    let old_nbt = read_node_btree(&mut file, *old_root.node_btree())?;
+    let header = FileHeader::read(&mut file)?;
+    // MailCraft: an ANSI file's too, its values widened.
+    let format = header.format();
+    let old_bbt = read_block_btree(&mut file, format, header.block_btree())?;
+    let old_nbt = read_node_btree(&mut file, format, header.node_btree())?;
     let bbt_entries = old_bbt.entries();
     let mut nbt_entries = old_nbt.entries();
-    let pst = Rc::new(open_to_add(path)?);
-    let store = UnicodeStore::read(pst)?;
+    let store = AddStore::open(path)?;
     let store_record_key = *store.properties().record_key()?.record_key();
     let parent_folder = store.open_folder(&store.properties().make_entry_id(parent)?)?;
     let parent_has_subfolders = parent_folder.properties().has_sub_folders()?;
@@ -4431,8 +4468,12 @@ fn create_unicode_folder(
     if !parent_has_subfolders {
         set_folder_boolean_property(&mut parent_properties, 0x360A, true);
     }
-    let mut parent_subnodes =
-        collect_subnode_entries(&mut file, *old_root.block_btree(), parent_entry.sub_node())?;
+    let mut parent_subnodes = collect_subnode_entries(
+        &mut file,
+        format,
+        header.block_btree(),
+        parent_entry.sub_node(),
+    )?;
     let parent_row_hierarchy = (!parent_has_subfolders)
         .then(|| -> io::Result<_> {
             let grandparent = parent_entry.parent().ok_or_else(|| {
@@ -4451,7 +4492,7 @@ fn create_unicode_folder(
                 io::Error::new(io::ErrorKind::NotFound, "parent hierarchy table not found")
             })?;
             let subnodes =
-                collect_subnode_entries(&mut file, *old_root.block_btree(), entry.sub_node())?;
+                collect_subnode_entries(&mut file, format, header.block_btree(), entry.sub_node())?;
             let rows_node = table_rows_node(table.as_ref(), &subnodes)?;
             Ok((node, entry, table, subnodes, rows_node))
         })
@@ -4485,7 +4526,7 @@ fn create_unicode_folder(
         .find(|entry| entry.node() == NodeId::from(0x60F))
         .map(NodeBTreeEntry::data);
 
-    let mut next_bid = header.next_block().index().max(
+    let mut next_bid = header.next_block_index().max(
         bbt_entries
             .iter()
             .map(|entry| entry.block().block().index())
@@ -4493,7 +4534,7 @@ fn create_unicode_folder(
             .unwrap_or(0)
             .saturating_add(1),
     );
-    let mut next_offset = FileSpace::read(&mut file, &old_root, &old_bbt, &old_nbt)?;
+    let mut next_offset = FileSpace::read(&mut file, &header, &old_bbt, &old_nbt)?;
     let mut blocks = Vec::new();
 
     let (hierarchy_data_bid, hierarchy_subnode_bid) =
@@ -4502,7 +4543,8 @@ fn create_unicode_folder(
         {
             let mut hierarchy_subnodes = collect_subnode_entries(
                 &mut file,
-                *old_root.block_btree(),
+                format,
+                header.block_btree(),
                 hierarchy_entry.sub_node(),
             )?;
             let rows_node = table_rows_node(hierarchy_table.as_ref(), &hierarchy_subnodes)?;
@@ -4515,6 +4557,7 @@ fn create_unicode_folder(
                 false,
                 rows_node,
                 header.unique_value(),
+                format,
             )?;
             let data = push_data_tree_chunks(&mut blocks, &mut next_bid, &mut next_offset, pages)?;
             let rows = push_data_tree_chunks(&mut blocks, &mut next_bid, &mut next_offset, rows)?;
@@ -4533,7 +4576,7 @@ fn create_unicode_folder(
                 &mut next_bid,
                 &mut next_offset,
                 false,
-                NewBlockData::Data(table_context_data(&[folder])?),
+                NewBlockData::Data(table_context_data(&[folder], format)?),
             )?;
             (data, None)
         };
@@ -4550,7 +4593,7 @@ fn create_unicode_folder(
             .checked_add(1)
             .ok_or(PstError::IntegerConversion)?;
         let (parent_pages, external_properties) =
-            property_context_pages(parent_properties, next_property_subnode)?;
+            property_context_pages(parent_properties, next_property_subnode, format.text())?;
         let parent_data =
             push_data_tree_chunks(&mut blocks, &mut next_bid, &mut next_offset, parent_pages)?;
         for (node, data) in external_properties {
@@ -4575,7 +4618,7 @@ fn create_unicode_folder(
         &mut next_bid,
         &mut next_offset,
         false,
-        NewBlockData::Data(folder_data(name, 0, false, container_class)?),
+        NewBlockData::Data(folder_data(name, 0, false, container_class, format.text())?),
     )?;
     let folder_hierarchy = NodeId::new(NodeIdType::HierarchyTable, folder.index())?;
     let folder_hierarchy_bid = match hierarchy_template {
@@ -4585,7 +4628,7 @@ fn create_unicode_folder(
             &mut next_bid,
             &mut next_offset,
             false,
-            NewBlockData::Data(table_context_data(&[])?),
+            NewBlockData::Data(table_context_data(&[], format)?),
         )?,
     };
     let folder_contents = NodeId::new(NodeIdType::ContentsTable, folder.index())?;
@@ -4596,7 +4639,7 @@ fn create_unicode_folder(
             &mut next_bid,
             &mut next_offset,
             false,
-            NewBlockData::Data(table_context_data(&[])?),
+            NewBlockData::Data(table_context_data(&[], format)?),
         )?,
     };
     let folder_associated_contents =
@@ -4608,7 +4651,7 @@ fn create_unicode_folder(
             &mut next_bid,
             &mut next_offset,
             false,
-            NewBlockData::Data(table_context_data(&[])?),
+            NewBlockData::Data(table_context_data(&[], format)?),
         )?,
     };
 
@@ -4622,6 +4665,7 @@ fn create_unicode_folder(
             header.unique_value(),
             Some((parent, &[(0x360A, PropertyValue::Boolean(true))])),
             true,
+            format,
         )?;
         let data = push_data_tree_chunks(&mut blocks, &mut next_bid, &mut next_offset, pages)?;
         let rows = push_data_tree_chunks(&mut blocks, &mut next_bid, &mut next_offset, rows)?;
@@ -4661,7 +4705,7 @@ fn create_unicode_folder(
     ]);
 
     append_search_updates(
-        &store,
+        &*store,
         &mut nbt_entries,
         &mut blocks,
         &mut next_bid,
@@ -4709,11 +4753,10 @@ fn ensure_unicode_folder_path(
     container_class: &str,
 ) -> io::Result<NodeId> {
     validate_folder_path(folder_path)?;
-    let pst = Rc::new(open_to_add(path)?);
-    let mut store = UnicodeStore::read(pst)?;
+    let mut store = AddStore::open(path)?;
     let mut parent = store.properties().ipm_sub_tree_entry_id()?.node_id();
     for (index, name) in folder_path.iter().enumerate() {
-        if let Some(folder) = find_child_folder(&store, parent, name)? {
+        if let Some(folder) = find_child_folder(&*store, parent, name)? {
             parent = folder;
             continue;
         }
@@ -4724,7 +4767,7 @@ fn ensure_unicode_folder_path(
             MAIL_CONTAINER_CLASS
         };
         parent = create_unicode_folder(path, parent, name, class)?;
-        store = UnicodeStore::read(Rc::new(open_to_add(path)?))?;
+        store = AddStore::open(path)?;
     }
     Ok(parent)
 }
@@ -4749,18 +4792,18 @@ fn append_unicode_pst(
         .map(|folder_path| ensure_unicode_folder_path(path, folder_path, MAIL_CONTAINER_CLASS))
         .transpose()?;
     let mut file = OpenOptions::new().read(true).write(true).open(path)?;
-    let mut header = UnicodeHeader::read(&mut file)?;
+    let mut header = FileHeader::read(&mut file)?;
     // MailCraft: a permute- or cyclic-encoded file (Outlook's default is permute) is added to
     // as well: its blocks are read decoded and new data blocks are written encoded alike.
     let encoding = header.crypt_method();
-    let old_root = header.root().clone();
-    let old_bbt = read_block_btree(&mut file, *old_root.block_btree())?;
-    let old_nbt = read_node_btree(&mut file, *old_root.node_btree())?;
+    // MailCraft: an ANSI file's too, its values widened.
+    let format = header.format();
+    let old_bbt = read_block_btree(&mut file, format, header.block_btree())?;
+    let old_nbt = read_node_btree(&mut file, format, header.node_btree())?;
     let mut bbt_entries = old_bbt.entries();
     let mut nbt_entries = old_nbt.entries();
 
-    let pst = Rc::new(open_to_add(path)?);
-    let store = UnicodeStore::read(pst)
+    let store = AddStore::open(path)
         .map_err(|err| io::Error::new(err.kind(), format!("read message store: {err}")))?;
     let store_record_key = *store
         .properties()
@@ -4769,7 +4812,7 @@ fn append_unicode_pst(
         .record_key();
     // MailCraft: the IDs of the named properties the messages have, added to the file's map
     // when it doesn't have them.
-    let named = resolve_named(&store, inputs)
+    let named = resolve_named(&*store, inputs)
         .map_err(|err| io::Error::new(err.kind(), format!("name-to-ID map: {err}")))?;
     let folder =
         requested_folder
@@ -4812,17 +4855,24 @@ fn append_unicode_pst(
             .and_then(|count| message_index.checked_add(count))
             .ok_or(PstError::IntegerConversion)?,
     );
+    // MailCraft: how each message's strings are written (8-bit in an ANSI file).
+    let texts = inputs
+        .iter()
+        .map(|input| message_text(format, &input.message, input.attachments))
+        .collect::<Vec<_>>();
     let message_sizes = inputs
         .iter()
         .zip(&messages)
+        .zip(&texts)
         .enumerate()
-        .map(|(position, (input, message))| {
+        .map(|(position, ((input, message), text))| {
             message_size(
                 &input.message,
                 input.attachments,
                 &named,
                 *message,
                 header.unique_value(),
+                *text,
             )
             .map_err(|err| {
                 let file_size = file.metadata().map(|metadata| metadata.len()).unwrap_or(0);
@@ -4865,21 +4915,26 @@ fn append_unicode_pst(
                 io::Error::new(io::ErrorKind::NotFound, "parent hierarchy table not found")
             })?;
             let subnodes =
-                collect_subnode_entries(&mut file, *old_root.block_btree(), entry.sub_node())?;
+                collect_subnode_entries(&mut file, format, header.block_btree(), entry.sub_node())?;
             let rows_node = table_rows_node(table.as_ref(), &subnodes)?;
             Ok((node, entry, table, subnodes, rows_node))
         })
         .transpose()?;
-    let mut folder_subnodes =
-        collect_subnode_entries(&mut file, *old_root.block_btree(), folder_entry.sub_node())?;
+    let mut folder_subnodes = collect_subnode_entries(
+        &mut file,
+        format,
+        header.block_btree(),
+        folder_entry.sub_node(),
+    )?;
     let mut contents_subnodes = collect_subnode_entries(
         &mut file,
-        *old_root.block_btree(),
+        format,
+        header.block_btree(),
         contents_entry.sub_node(),
     )?;
     let rows_node = table_rows_node(contents_table.as_ref(), &contents_subnodes)?;
 
-    let mut next_bid = header.next_block().index().max(
+    let mut next_bid = header.next_block_index().max(
         bbt_entries
             .iter()
             .map(|entry| entry.block().block().index())
@@ -4887,13 +4942,17 @@ fn append_unicode_pst(
             .unwrap_or(0)
             .saturating_add(1),
     );
-    let mut next_offset = FileSpace::read(&mut file, &old_root, &old_bbt, &old_nbt)?;
+    let mut next_offset = FileSpace::read(&mut file, &header, &old_bbt, &old_nbt)?;
     header.update_unique();
 
     let mut message_entries = Vec::with_capacity(inputs.len());
-    let mut block_writer = BlockWriter::new(encoding);
-    for (position, ((input, message), message_size)) in
-        inputs.iter().zip(&messages).zip(&message_sizes).enumerate()
+    let mut block_writer = BlockWriter::new(encoding, format);
+    for (position, (((input, message), message_size), text)) in inputs
+        .iter()
+        .zip(&messages)
+        .zip(&message_sizes)
+        .zip(&texts)
+        .enumerate()
     {
         let mut blocks = Vec::new();
         let result = (|| {
@@ -4913,6 +4972,7 @@ fn append_unicode_pst(
                 *message_size,
                 &mut embedded_ids,
                 &mut flush,
+                *text,
             )?;
             flush(&mut blocks)?;
             Ok::<_, io::Error>(UnicodeNodeBTreeEntry::new(
@@ -4959,6 +5019,7 @@ fn append_unicode_pst(
             &message_sizes,
             next_contents_subnode,
             header.unique_value(),
+            &texts,
         )?;
         let old_rows_bid = contents_subnodes
             .iter()
@@ -4984,6 +5045,7 @@ fn append_unicode_pst(
             new_rows,
             Some(rows_node),
             header.unique_value(),
+            format,
         )?;
         let heap = push_data_tree_chunks(&mut blocks, &mut next_bid, &mut next_offset, heap)?;
         let rows = push_data_tree_chunks(&mut blocks, &mut next_bid, &mut next_offset, rows)?;
@@ -5037,7 +5099,7 @@ fn append_unicode_pst(
         .checked_add(1)
         .ok_or(PstError::IntegerConversion)?;
     let (folder_pages, external_properties) =
-        property_context_pages(folder_properties, next_property_subnode)?;
+        property_context_pages(folder_properties, next_property_subnode, format.text())?;
     let folder_data_bid =
         push_data_tree_chunks(&mut blocks, &mut next_bid, &mut next_offset, folder_pages)?;
     for (node, data) in external_properties {
@@ -5095,6 +5157,7 @@ fn append_unicode_pst(
                 header.unique_value(),
                 Some((folder, &counts)),
                 true,
+                format,
             )?;
             (
                 push_data_tree_chunks(&mut blocks, &mut next_bid, &mut next_offset, pages)?,
@@ -5143,7 +5206,7 @@ fn append_unicode_pst(
     }
 
     append_search_updates(
-        &store,
+        &*store,
         &mut nbt_entries,
         &mut blocks,
         &mut next_bid,
@@ -5228,7 +5291,9 @@ mod create_tests {
             .unwrap()
             .node_id();
         for name in folder_path {
-            folder = find_child_folder(store, folder, name).unwrap().unwrap();
+            folder = find_child_folder(store.as_ref(), folder, name)
+                .unwrap()
+                .unwrap();
         }
         store
             .open_folder(&store.properties().make_entry_id(folder).unwrap())
@@ -5510,7 +5575,7 @@ mod create_tests {
             let ipm_id = store.properties().ipm_sub_tree_entry_id().unwrap();
             let ipm = store.open_folder(&ipm_id).unwrap();
             let hierarchy = ipm.hierarchy_table().unwrap();
-            let inbox_id = find_child_folder(&store, ipm_id.node_id(), "Inbox")
+            let inbox_id = find_child_folder(store.as_ref(), ipm_id.node_id(), "Inbox")
                 .unwrap()
                 .unwrap();
             let row = hierarchy
@@ -5564,7 +5629,7 @@ mod create_tests {
     fn fills_nonfinal_data_tree_blocks() {
         let mut blocks = Vec::new();
         let mut next_bid = 1;
-        let mut next_offset = FileSpace::from(AMAP_FIRST_OFFSET);
+        let mut next_offset = FileSpace::new(AMAP_FIRST_OFFSET, Format::Unicode);
         let root = push_data_tree_chunks(
             &mut blocks,
             &mut next_bid,
@@ -5586,7 +5651,7 @@ mod create_tests {
     fn writes_local_totals_for_multilevel_data_trees() {
         let mut blocks = Vec::new();
         let mut next_bid = 1;
-        let mut next_offset = FileSpace::from(AMAP_FIRST_OFFSET);
+        let mut next_offset = FileSpace::new(AMAP_FIRST_OFFSET, Format::Unicode);
         let root = push_data_tree_chunks(
             &mut blocks,
             &mut next_bid,
@@ -6411,6 +6476,7 @@ mod create_tests {
                 None,
                 0,
                 None,
+                Text::Unicode,
             )
             .unwrap_err()
             .kind(),
@@ -6433,9 +6499,10 @@ mod create_tests {
         ] {
             let mut metadata_offset = first;
             while metadata_offset < LIMIT {
-                let mut next_offset = FileSpace::from(metadata_offset);
+                let mut next_offset = FileSpace::new(metadata_offset, Format::Unicode);
                 let allocation =
-                    reserve_file_range(&mut next_offset, PAGE_SIZE as u64, PAGE_SIZE as u64);
+                    reserve_file_range(&mut next_offset, PAGE_SIZE as u64, PAGE_SIZE as u64)
+                        .unwrap();
                 assert!(
                     allocation > metadata_offset,
                     "allocated over metadata page at 0x{metadata_offset:X}"
@@ -6582,7 +6649,9 @@ mod create_tests {
             .unwrap();
         let mut header = UnicodeHeader::read(&mut file).unwrap();
         assert_eq!(header.crypt_method(), NdbCryptMethod::Permute);
-        let entries = collect_block_btree_entries(&mut file, *header.root().block_btree()).unwrap();
+        let entries =
+            collect_block_btree_entries(&mut file, Format::Unicode, *header.root().block_btree())
+                .unwrap();
         for entry in entries
             .iter()
             .filter(|entry| !entry.block().block().is_internal())
@@ -6630,10 +6699,15 @@ mod create_tests {
             .next_node_index(NodeIdType::NormalMessage)
             .unwrap();
         let mut reader = File::open(&path).unwrap();
-        let nbt_entries =
-            collect_node_btree_entries(&mut reader, *pst.header().root().node_btree()).unwrap();
+        let nbt_entries = collect_node_btree_entries(
+            &mut reader,
+            Format::Unicode,
+            *pst.header().root().node_btree(),
+        )
+        .unwrap();
         let store = UnicodeStore::read(pst).unwrap();
-        let inbox_id = default_receive_folder(&store, &nbt_entries).unwrap();
+        let inbox_id =
+            default_receive_folder(&AddStore::open(&path).unwrap(), &nbt_entries).unwrap();
         let inbox = store
             .open_folder(&store.properties().make_entry_id(inbox_id).unwrap())
             .unwrap();
@@ -6712,8 +6786,12 @@ mod create_tests {
         let mut header = UnicodeHeader::read(&mut file).unwrap();
         assert_eq!(header.crypt_method(), NdbCryptMethod::Permute);
         if method != NdbCryptMethod::Permute {
-            let entries =
-                collect_block_btree_entries(&mut file, *header.root().block_btree()).unwrap();
+            let entries = collect_block_btree_entries(
+                &mut file,
+                Format::Unicode,
+                *header.root().block_btree(),
+            )
+            .unwrap();
             for entry in entries
                 .iter()
                 .filter(|entry| !entry.block().block().is_internal())
@@ -6742,7 +6820,9 @@ mod create_tests {
     fn data_blocks(path: &Path) -> Vec<(Vec<u8>, Vec<u8>)> {
         let mut file = File::open(path).unwrap();
         let header = UnicodeHeader::read(&mut file).unwrap();
-        let entries = collect_block_btree_entries(&mut file, *header.root().block_btree()).unwrap();
+        let entries =
+            collect_block_btree_entries(&mut file, Format::Unicode, *header.root().block_btree())
+                .unwrap();
         entries
             .iter()
             .filter(|entry| !entry.block().block().is_internal())
@@ -6810,8 +6890,10 @@ mod create_tests {
                 .unwrap()
                 .root()
                 .node_btree();
-            let nbt_entries = collect_node_btree_entries(&mut reader, nbt_root).unwrap();
-            let inbox_id = default_receive_folder(&store, &nbt_entries).unwrap();
+            let nbt_entries =
+                collect_node_btree_entries(&mut reader, Format::Unicode, nbt_root).unwrap();
+            let inbox_id =
+                default_receive_folder(&AddStore::open(&path).unwrap(), &nbt_entries).unwrap();
             let inbox = store
                 .open_folder(&store.properties().make_entry_id(inbox_id).unwrap())
                 .unwrap();
@@ -6892,9 +6974,11 @@ mod create_tests {
         let mut file = File::open(path).unwrap();
         let header = UnicodeHeader::read(&mut file).unwrap();
         let root = header.root();
-        let bbt = read_block_btree(&mut file, *root.block_btree()).unwrap();
-        let nbt = read_node_btree(&mut file, *root.node_btree()).unwrap();
-        FileSpace::read(&mut file, root, &bbt, &nbt).unwrap().free
+        let bbt = read_block_btree(&mut file, Format::Unicode, *root.block_btree()).unwrap();
+        let nbt = read_node_btree(&mut file, Format::Unicode, *root.node_btree()).unwrap();
+        FileSpace::read(&mut file, &FileHeader::Unicode(header.clone()), &bbt, &nbt)
+            .unwrap()
+            .free
     }
 
     #[test]
@@ -7003,6 +7087,7 @@ mod create_tests {
                 PropertyValue::Binary(BinaryValue::new(value.clone())),
             )],
             0x300,
+            Text::Unicode,
         )
         .unwrap();
         assert!(!pages.is_empty());
@@ -7970,7 +8055,14 @@ mod existing_file_tests {
         let id = UnicodeBlockId::new(true, 2).unwrap();
         let entry = put(&mut file, xblock(id, 0, &[id], 100));
         // It used to recurse until the stack overflowed.
-        assert!(data_tree_leaves(&mut file, NdbCryptMethod::None, &[entry], id).is_err());
+        assert!(data_tree_leaves(
+            &mut file,
+            Format::Unicode,
+            NdbCryptMethod::None,
+            &[entry],
+            id
+        )
+        .is_err());
         drop(file);
         std::fs::remove_file(path).unwrap();
     }
@@ -7992,7 +8084,14 @@ mod existing_file_tests {
         let tree_entry = put(&mut file, xblock(tree, 192, &[leaf; 1000], 250));
         let mut entries = vec![leaf_entry, tree_entry];
         entries.sort_by_key(BTreeEntry::key);
-        let leaves = data_tree_leaves(&mut file, NdbCryptMethod::None, &entries, tree).unwrap();
+        let leaves = data_tree_leaves(
+            &mut file,
+            Format::Unicode,
+            NdbCryptMethod::None,
+            &entries,
+            tree,
+        )
+        .unwrap();
         // 250 bytes declared: three 100-byte blocks reach it, where all 1,000 were listed.
         assert_eq!(leaves.len(), 3);
         drop(file);

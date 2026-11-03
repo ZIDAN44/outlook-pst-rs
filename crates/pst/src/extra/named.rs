@@ -128,7 +128,7 @@ fn guid_index(set: [u8; 16], guids: &mut Vec<u8>) -> io::Result<u16> {
 /// it doesn't have are added to a new copy of its properties (`new_map`). The map's streams are
 /// read as the reader reads them, within the file's limit.
 pub(crate) fn resolve(
-    store: &Rc<UnicodeStore>,
+    store: &dyn Store,
     inputs: &[UnicodePstBatchMessage<'_>],
 ) -> io::Result<NamedIds> {
     let mut wanted = Vec::new();
@@ -274,7 +274,8 @@ pub(crate) fn push_map(
         .find(|entry| entry.node() == NID_NAME_TO_ID_MAP)
         .copied()
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "name-to-ID map not found"))?;
-    let (pages, external) = property_context_pages(properties, 1)?;
+    // Its streams are binary, in an ANSI file too (MS-PST 2.4.7).
+    let (pages, external) = property_context_pages(properties, 1, next_offset.format.text())?;
     let data = push_data_tree_chunks(blocks, next_bid, next_offset, pages)?;
     let mut subnodes = Vec::with_capacity(external.len());
     for (node, value) in external {
