@@ -259,3 +259,10 @@ are the writer's own.
     it; a folder already there keeps its own.
 
     Test: `extra::folders::tests::pim_folders_are_made_with_their_class_and_recorded`.
+22. **A file with no message** (`lib.rs`): a new file was always made with its first message,
+    in folders made `IPF.Note` on the way, so a file whose first item is a contact had its
+    Contacts folder made as a folder of mail. `UnicodePstFile::create_empty` makes Outlook's empty
+    file, unencoded, with an empty Inbox, as `create*` start from; `create_folder` and the
+    `append*` calls go on from there.
+
+    Test: `extra::folders::tests::an_empty_file_takes_a_folder_of_its_own_class_first`.

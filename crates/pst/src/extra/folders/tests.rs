@@ -1,5 +1,5 @@
 use super::*;
-use crate::extra::tests::{cell, folder, message, temp_pst, text};
+use crate::extra::tests::{cell, folder, message, messages, temp_pst, text};
 
 const ROLES: [UnicodePstSpecialFolder; 5] = [
     UnicodePstSpecialFolder::DeletedItems,
@@ -401,5 +401,29 @@ fn pim_folders_are_made_with_their_class_and_recorded() {
         UnicodePstFile::special_folder(&path, UnicodePstSpecialFolder::DeletedItems).unwrap(),
         Some(vec!["Deleted Items".to_string()])
     );
+    std::fs::remove_file(path).unwrap();
+}
+
+/// MailCraft: a file made with no message has an empty Inbox, and its first item can go in a
+/// folder of its own class.
+#[test]
+fn an_empty_file_takes_a_folder_of_its_own_class_first() {
+    let path = temp_pst("empty-file");
+    drop(UnicodePstFile::create_empty(&path).unwrap());
+    assert!(UnicodePstFile::create_empty(&path).is_err());
+    drop(UnicodePstFile::create_folder(&path, &["Contacts"], "IPF.Contact").unwrap());
+    let contact = UnicodePstMessage {
+        message_class: "IPM.Contact",
+        ..message("Ana Ruiz", "", &[])
+    };
+    drop(UnicodePstFile::append_in_folder(&path, &["Contacts"], &contact).unwrap());
+    let store = open_store(&path);
+    let (_, inbox) = folder(&store, &["Inbox"]);
+    assert_eq!(messages(&store, &inbox).len(), 0);
+    let (_, contacts) = folder(&store, &["Contacts"]);
+    assert_eq!(text(contacts.properties().get(0x3613)), "IPF.Contact");
+    let all = messages(&store, &contacts);
+    assert_eq!(all.len(), 1);
+    assert_eq!(text(all[0].1.properties().get(0x001A)), "IPM.Contact");
     std::fs::remove_file(path).unwrap();
 }

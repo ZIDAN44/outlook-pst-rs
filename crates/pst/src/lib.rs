@@ -358,6 +358,14 @@ impl UnicodePstFile {
         Self::open(path)
     }
 
+    /// MailCraft: create a new Unicode PST with an empty Inbox and no message, for a file whose
+    /// first items go in folders made with a container class of their own
+    /// ([`UnicodePstFile::create_folder`]).
+    pub fn create_empty(path: impl AsRef<Path>) -> io::Result<Self> {
+        create_empty_unicode_pst(path.as_ref())?;
+        Self::open(path)
+    }
+
     /// Set the store display name (PR_DISPLAY_NAME of the message store) of an existing
     /// Unicode PST. Outlook shows it as the top-level name when the file is opened.
     pub fn set_store_display_name(path: impl AsRef<Path>, name: &str) -> io::Result<Self> {
@@ -3593,7 +3601,25 @@ fn create_unicode_pst(
     if let Some(folder_path) = folder_path {
         validate_folder_path(folder_path)?;
     }
+    create_empty_unicode_pst(path)?;
+    let inbox = ["Inbox"];
+    let result = append_unicode_pst(
+        path,
+        &[UnicodePstBatchMessage {
+            message: *input,
+            attachments,
+        }],
+        Some(folder_path.unwrap_or(&inbox)),
+    );
+    if result.is_err() {
+        let _ = std::fs::remove_file(path);
+    }
+    result
+}
 
+/// MailCraft: Outlook's empty file, unencoded, with an Inbox: what [`create_unicode_pst`] adds its
+/// first message to. The file is removed again when it can't be made whole.
+fn create_empty_unicode_pst(path: &Path) -> io::Result<()> {
     let mut file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -3635,19 +3661,7 @@ fn create_unicode_pst(
         let _ = std::fs::remove_file(path);
         return Err(error);
     }
-    let inbox = ["Inbox"];
-    let result = append_unicode_pst(
-        path,
-        &[UnicodePstBatchMessage {
-            message: *input,
-            attachments,
-        }],
-        Some(folder_path.unwrap_or(&inbox)),
-    );
-    if result.is_err() {
-        let _ = std::fs::remove_file(path);
-    }
-    result
+    Ok(())
 }
 fn default_receive_folder(
     store: &Rc<UnicodeStore>,
