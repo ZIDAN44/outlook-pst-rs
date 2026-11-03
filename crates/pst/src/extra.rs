@@ -31,6 +31,8 @@ pub enum UnicodePstValue<'a> {
     Integer32(i32),
     /// `PtypBoolean`.
     Boolean(bool),
+    /// MailCraft: `PtypFloating64` (a task's `PidLidPercentComplete` is one).
+    Floating64(f64),
     /// `PtypTime`: 100-nanosecond intervals since 1601-01-01 UTC.
     Time(i64),
     /// `PtypString`.
@@ -50,6 +52,7 @@ impl UnicodePstValue<'_> {
             Self::Integer16(value) => PropertyValue::Integer16(value),
             Self::Integer32(value) => PropertyValue::Integer32(value),
             Self::Boolean(value) => PropertyValue::Boolean(value),
+            Self::Floating64(value) => PropertyValue::Floating64(value),
             Self::Time(value) => PropertyValue::Time(value),
             Self::Unicode(value) => PropertyValue::Unicode(unicode(value)),
             Self::Binary(value) => PropertyValue::Binary(BinaryValue::new(value.to_vec())),

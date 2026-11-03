@@ -241,3 +241,9 @@ are the writer's own.
     Test: `extra::folders::tests::a_folder_listed_under_itself_is_looked_through_once` (a folder
     whose hierarchy table names it twice, in its row index and its rows: looking for a folder that
     isn't there ends; without the fix it ran on past a minute).
+20. **64-bit floats** (`extra.rs`): `UnicodePstValue` had no `PtypFloating64`, so a task's
+    `PidLidPercentComplete` (a fraction of 1, MS-OXOTASK 2.2.2.2.3) couldn't be written.
+    `UnicodePstValue::Floating64` writes one, in the message and in a contents table column of
+    that type.
+
+    Test: `extra::tests::a_message_keeps_its_class_and_added_properties` (0.4 read back).

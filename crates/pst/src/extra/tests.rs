@@ -105,6 +105,7 @@ fn a_message_keeps_its_class_and_added_properties() {
         UnicodePstProperty::tagged(0x6601, UnicodePstValue::Integer16(-7)),
         UnicodePstProperty::tagged(0x6602, UnicodePstValue::MultipleUnicode(&categories)),
         UnicodePstProperty::tagged(0x6603, UnicodePstValue::MultipleBinary(&blobs)),
+        UnicodePstProperty::tagged(0x6604, UnicodePstValue::Floating64(0.4)),
     ];
     let first = UnicodePstMessage {
         message_class: "IPM.Note.Custom",
@@ -188,6 +189,8 @@ fn a_message_keeps_its_class_and_added_properties() {
         }
         value => panic!("binaries: {value:?}"),
     }
+    // MailCraft: a 64-bit float, as a task's percent complete is kept.
+    assert!(matches!(p.get(0x6604), Some(PropertyValue::Floating64(f)) if *f == 0.4));
     // The contents table's row says the same, for the columns it has.
     let table = contents.as_ref();
     assert!(matches!(
