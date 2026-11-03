@@ -5,6 +5,7 @@ use super::*;
 
 mod ansi;
 mod attach;
+mod delete;
 mod folders;
 mod format;
 mod named;

@@ -55,7 +55,7 @@ fn windows_1252(value: &str) -> Vec<u8> {
 /// Every block of the ANSI file at `path` as MS-PST 2.2.2.8 keeps one: its 12-byte trailer
 /// naming its size and BID, its CRC and signature right; and no two blocks or B-tree pages
 /// share space, all of them before the end of the file the header gives.
-fn check_ansi_file(path: &Path) {
+pub(crate) fn check_ansi_file(path: &Path) {
     let raw = std::fs::read(path).unwrap();
     let mut file = File::open(path).unwrap();
     let header = FileHeader::read(&mut file).unwrap();

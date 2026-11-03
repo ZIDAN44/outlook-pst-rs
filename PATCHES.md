@@ -330,3 +330,25 @@ are the writer's own.
     temporary folder, opened `create_new` under a name of the process, the time and a count.
 
     Test: `extra::ansi::tests::a_new_ansi_file_leaves_its_neighbours_alone`.
+27. **Messages taken out of a file** (`extra/delete.rs`): the writer could only add, so a caller
+    that wrote an item again (a changed contact, say) left its earlier copy beside it.
+    `UnicodePstFile::delete_messages` and `AnsiPstFile::delete_messages` take messages out by
+    their node IDs, whatever folders they are in, in one commit, as MS-PST 2.6.1 lays a message
+    out: each one's node leaves the node B-tree, so its property context's and subnode tree's
+    blocks lose a reference each and those no node names any more leave the block B-tree with
+    their children (`update_block_ref_counts`, checked in tests against a walk from every node);
+    its row leaves its folder's contents table and any search folder's that lists it (each table
+    written again in a heap of its own, its cells kept in subnodes going with their rows); the
+    folder's `PidTagContentCount` and `PidTagContentUnreadCount` are counted again (the unread
+    ones by their rows' `PidTagMessageFlags`), in its property context and in its row of its
+    parent's hierarchy table; and a `SUD_MSG_DEL` for it goes in the search update queue
+    (MS-PST 2.4.8.4.2). The header and the allocation map are written as after an append, so the
+    space the freed blocks held is free in the new map, and the next blocks written take it. An
+    ID that is not a message in a folder of the file, or given twice, is an `InvalidInput` error
+    before the file is touched.
+
+    Tests: `extra::delete::tests` (messages deleted from a new Unicode file, one by one until
+    the folder is empty and then added to again, from an ANSI file and from Outlook's own
+    permute-encoded fixture, one of them listed in its search folder; read back with the reader,
+    the counts right, no two blocks or pages sharing space, every block's count the walk's, the
+    allocation map trusted and a big message's space taken by the next one).

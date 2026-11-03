@@ -431,4 +431,4 @@ fn ansi_table(table: &dyn TableContext) -> io::Result<RebuiltRecipientTable> {
 }
 
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;
