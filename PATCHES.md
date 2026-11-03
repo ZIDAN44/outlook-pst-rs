@@ -4,11 +4,13 @@ This branch, `craft/rw-1.2.14`, is Dong Shin's Outlook data file writer,
 [outlook-pst-rw](https://crates.io/crates/outlook-pst-rw) 1.2.14 (the tag `outlook-pst-rw-v1.2.14`,
 commit `4799f5d0`, of [dongs0104/outlook-pst-rs](https://github.com/dongs0104/outlook-pst-rs), MIT,
 `LICENSE`), with the fixes below. That crate is itself a fork of Microsoft's reader,
-[outlook-pst](https://crates.io/crates/outlook-pst), which MailCraft builds from this repository's
-`craft/1.2.0` branch; the writer keeps its own copy of the reader's modules, so the reader's fixes
-are carried over here as well. [MailCraft](https://github.com/ZIDAN44/mailcraft) builds the writer
-through `[patch.crates-io]` in its `Cargo.toml` and in `fuzz/Cargo.toml`, pinned to a revision of
-this branch; its `cargo xtask ci` checks that both pin the same one.
+[outlook-pst](https://crates.io/crates/outlook-pst): it keeps its own copy of the reader's modules
+and the reader's library name, `outlook_pst`, so the reader's fixes from this repository's
+`craft/1.2.0` branch are carried over here as well. [MailCraft](https://github.com/ZIDAN44/mailcraft)
+reads and writes `.pst` files with this crate alone (`craft/1.2.0`, which it read with before, is
+superseded by this branch), building it through `[patch.crates-io]` in its `Cargo.toml` and in
+`fuzz/Cargo.toml`, pinned to a revision of this branch; its `cargo xtask ci` checks that both pin
+the same one.
 
 Only `crates/pst` changes. Each fix is its own commit, follows MailCraft's rules all the same (no
 new panics, checked sizes), and is proved by the tests beside it (`cargo test -p outlook-pst-rw`).
