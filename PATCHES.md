@@ -268,3 +268,13 @@ are the writer's own.
     `append*` calls go on from there.
 
     Test: `extra::folders::tests::an_empty_file_takes_a_folder_of_its_own_class_first`.
+23. **A recipient's flags and track status** (`lib.rs`): a recipient row had its type, names and
+    addresses alone, so a meeting's organizer couldn't be told from its attendees, nor what each
+    attendee answered. `UnicodePstRecipient` takes `flags` (`PidTagRecipientFlags`, 0x5FFD:
+    `recipSendable`, `recipOrganizer`…) and `track_status` (`PidTagRecipientTrackStatus`, 0x5FFF:
+    accepted, tentative, declined, not answered), each in a column of the recipient table
+    (MS-OXOCAL 2.2.4.10) whose cell is there when given; the row grows from 56 to 65 bytes. It is
+    `Default` (a `To` recipient with neither) for callers that set what they need.
+
+    Tests: `extra::tests::recipients_keep_their_flags_and_track_status` (a new file and one added
+    to), `extra::attach::tests` (an attached message's recipient).

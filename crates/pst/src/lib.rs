@@ -246,19 +246,26 @@ pub struct UnicodePstFile {
 
 /// A recipient type written to `PR_RECIPIENT_TYPE`.
 #[repr(i32)]
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum UnicodePstRecipientType {
+    #[default]
     To = 1,
     Cc = 2,
     Bcc = 3,
 }
 
 /// A message recipient for the Unicode PST writer.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 pub struct UnicodePstRecipient<'a> {
     pub name: &'a str,
     pub email: &'a str,
     pub recipient_type: UnicodePstRecipientType,
+    /// MailCraft: `PidTagRecipientFlags` (0x5FFD, MS-OXOCAL 2.2.4.10.1: `recipSendable` 0x1,
+    /// `recipOrganizer` 0x2…), in the recipient's row when given.
+    pub flags: Option<i32>,
+    /// MailCraft: `PidTagRecipientTrackStatus` (0x5FFF, MS-OXOCAL 2.2.4.10.2: how a meeting's
+    /// attendee answered), in the recipient's row when given.
+    pub track_status: Option<i32>,
 }
 
 /// Message input for the Unicode PST writer.
@@ -2132,13 +2139,19 @@ fn recipient_search_key(email: &str) -> Vec<u8> {
     key
 }
 
+/// MailCraft: where a recipient row's two booleans start, after its 4-byte columns (the
+/// flags and track status among them), and the row's size with its 17 columns' existence
+/// bitmap (3 bytes).
+const RECIPIENT_BOOLEANS: u16 = 60;
+const RECIPIENT_ROW: u16 = RECIPIENT_BOOLEANS + 2 + 3;
+
 fn recipient_table_data(
     recipients: &[UnicodePstRecipient<'_>],
     row_version: u32,
 ) -> io::Result<RebuiltRecipientTable> {
     let columns = vec![
         TableColumnDescriptor::new(PropertyType::Integer32, 0x0C15, 8, 4, 2),
-        TableColumnDescriptor::new(PropertyType::Boolean, 0x0E0F, 52, 1, 3),
+        TableColumnDescriptor::new(PropertyType::Boolean, 0x0E0F, RECIPIENT_BOOLEANS, 1, 3),
         TableColumnDescriptor::new(PropertyType::Binary, 0x0FF9, 12, 4, 4),
         TableColumnDescriptor::new(PropertyType::Integer32, 0x0FFE, 16, 4, 5),
         TableColumnDescriptor::new(PropertyType::Binary, 0x0FFF, 20, 4, 6),
@@ -2149,12 +2162,28 @@ fn recipient_table_data(
         TableColumnDescriptor::new(PropertyType::Integer32, 0x3900, 40, 4, 11),
         TableColumnDescriptor::new(PropertyType::Unicode, 0x39FE, 44, 4, 12),
         TableColumnDescriptor::new(PropertyType::Unicode, 0x39FF, 48, 4, 13),
-        TableColumnDescriptor::new(PropertyType::Boolean, 0x3A40, 53, 1, 14),
+        TableColumnDescriptor::new(PropertyType::Boolean, 0x3A40, RECIPIENT_BOOLEANS + 1, 1, 14),
+        // MailCraft: a meeting's organizer and attendees (MS-OXOCAL 2.2.4.10).
+        TableColumnDescriptor::new(PropertyType::Integer32, 0x5FFD, 52, 4, 15),
+        TableColumnDescriptor::new(PropertyType::Integer32, 0x5FFF, 56, 4, 16),
         TableColumnDescriptor::new(PropertyType::Integer32, LTP_ROW_ID_PROP_ID, 0, 4, 0),
         TableColumnDescriptor::new(PropertyType::Integer32, LTP_ROW_VERSION_PROP_ID, 4, 4, 1),
     ];
-    let row_context =
-        TableContextInfo::new(52, 52, 54, 56, HeapId::default(), None, columns.clone())?;
+    let ends = (
+        RECIPIENT_BOOLEANS,
+        RECIPIENT_BOOLEANS,
+        RECIPIENT_BOOLEANS + 2,
+        RECIPIENT_ROW,
+    );
+    let row_context = TableContextInfo::new(
+        ends.0,
+        ends.1,
+        ends.2,
+        ends.3,
+        HeapId::default(),
+        None,
+        columns.clone(),
+    )?;
     let row_ids = (1..=recipients.len())
         .map(|id| u32::try_from(id).map_err(|_| PstError::IntegerConversion.into()))
         .collect::<io::Result<Vec<_>>>()?;
@@ -2190,6 +2219,12 @@ fn recipient_table_data(
                     string_table_cell(PropertyType::Unicode, recipient.email),
                     string_table_cell(PropertyType::Unicode, display_name),
                     Some(TableCell::Value(PropertyValue::Boolean(false))),
+                    recipient
+                        .flags
+                        .map(|flags| TableCell::Value(PropertyValue::Integer32(flags))),
+                    recipient
+                        .track_status
+                        .map(|status| TableCell::Value(PropertyValue::Integer32(status))),
                     Some(TableCell::Value(PropertyValue::Integer32(
                         i32::try_from(*row_id).map_err(|_| PstError::IntegerConversion)?,
                     ))),
@@ -2204,12 +2239,14 @@ fn recipient_table_data(
     let rows_node = (!rows.is_empty())
         .then(|| NodeId::new(NodeIdType::Internal, 0x80))
         .transpose()?;
-    let context = TableContextInfo::new(52, 52, 54, 56, row_index, rows_node, columns)?;
+    let context = TableContextInfo::new(
+        ends.0, ends.1, ends.2, ends.3, row_index, rows_node, columns,
+    )?;
     let mut context_bytes = Vec::new();
     context.write(&mut context_bytes)?;
     let user_root = heap.alloc(context_bytes)?;
     let pages = heap.finish(HeapNodeType::Table, user_root)?;
-    let rows_per_block = MAX_DATA_BLOCK_SIZE / 56;
+    let rows_per_block = MAX_DATA_BLOCK_SIZE / usize::from(RECIPIENT_ROW);
     let row_chunks = rows
         .chunks(rows_per_block)
         .map(|chunk| chunk.concat())
@@ -5148,16 +5185,22 @@ mod create_tests {
             name: "to recipient",
             email: "to@example.com",
             recipient_type: UnicodePstRecipientType::To,
+            flags: None,
+            track_status: None,
         },
         UnicodePstRecipient {
             name: "cc recipient",
             email: "cc@example.com",
             recipient_type: UnicodePstRecipientType::Cc,
+            flags: None,
+            track_status: None,
         },
         UnicodePstRecipient {
             name: "bcc recipient",
             email: "bcc@example.com",
             recipient_type: UnicodePstRecipientType::Bcc,
+            flags: None,
+            track_status: None,
         },
     ];
 
@@ -5348,6 +5391,8 @@ mod create_tests {
                 name,
                 email,
                 recipient_type: UnicodePstRecipientType::To,
+                flags: None,
+                track_status: None,
             })
             .collect::<Vec<_>>();
         let display_to = recipient_display(&recipients, UnicodePstRecipientType::To);

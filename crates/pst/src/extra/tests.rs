@@ -278,3 +278,75 @@ fn a_class_or_property_that_cant_be_written_is_an_error() {
     assert_eq!(std::fs::read(&path).unwrap(), before);
     std::fs::remove_file(path).unwrap();
 }
+
+/// A meeting's organizer and attendees keep their flags and how each answered, in their rows of
+/// the recipient table; a recipient given neither has no such cells. Written in a new file and
+/// added to one, as the rows are made alike.
+#[test]
+fn recipients_keep_their_flags_and_track_status() {
+    let path = temp_pst("recipient-flags");
+    let recipients = [
+        UnicodePstRecipient {
+            name: "Organizer",
+            email: "organizer@example.com",
+            flags: Some(3),
+            track_status: Some(0),
+            ..Default::default()
+        },
+        UnicodePstRecipient {
+            name: "Accepted",
+            email: "accepted@example.com",
+            flags: Some(1),
+            track_status: Some(3),
+            ..Default::default()
+        },
+        UnicodePstRecipient {
+            name: "Plain",
+            email: "plain@example.com",
+            recipient_type: UnicodePstRecipientType::Cc,
+            ..Default::default()
+        },
+    ];
+    let meeting = UnicodePstMessage {
+        recipients: &recipients,
+        message_class: "IPM.Appointment",
+        ..message("Meeting", "", &[])
+    };
+    drop(UnicodePstFile::create(&path, &meeting).unwrap());
+    drop(UnicodePstFile::append(&path, &meeting).unwrap());
+    let store = UnicodeStore::read(Rc::new(UnicodePstFile::open(&path).unwrap())).unwrap();
+    let (_, inbox) = folder(&store, &["Inbox"]);
+    let all = messages(&store, &inbox);
+    assert_eq!(all.len(), 2);
+    for (_, m) in all {
+        let table = m.recipient_table().unwrap().clone();
+        let rows: Vec<u32> = table.rows_matrix().map(|row| u32::from(row.id())).collect();
+        let int = |row: u32, id: u16| match cell(table.as_ref(), row, id) {
+            Some(PropertyValue::Integer32(n)) => Some(n),
+            None => None,
+            value => panic!("not an integer: {value:?}"),
+        };
+        let got: Vec<_> = rows
+            .iter()
+            .map(|row| (int(*row, 0x0C15), int(*row, 0x5FFD), int(*row, 0x5FFF)))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                (Some(1), Some(3), Some(0)),
+                (Some(1), Some(1), Some(3)),
+                (Some(2), None, None)
+            ]
+        );
+        // The columns after them still read.
+        assert_eq!(
+            text(cell(table.as_ref(), rows[2], 0x39FE).as_ref()),
+            "plain@example.com"
+        );
+        assert!(matches!(
+            cell(table.as_ref(), rows[2], 0x0E0F),
+            Some(PropertyValue::Boolean(true))
+        ));
+    }
+    std::fs::remove_file(path).unwrap();
+}

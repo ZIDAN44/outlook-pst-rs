@@ -38,16 +38,22 @@ fn main() -> io::Result<()> {
             name: "Memex Recipient",
             email: "recipient@example.com",
             recipient_type: UnicodePstRecipientType::To,
+            flags: None,
+            track_status: None,
         },
         UnicodePstRecipient {
             name: "Memex CC",
             email: "cc@example.com",
             recipient_type: UnicodePstRecipientType::Cc,
+            flags: None,
+            track_status: None,
         },
         UnicodePstRecipient {
             name: "Memex BCC",
             email: "bcc@example.com",
             recipient_type: UnicodePstRecipientType::Bcc,
+            flags: None,
+            track_status: None,
         },
     ];
     let message = UnicodePstMessage {

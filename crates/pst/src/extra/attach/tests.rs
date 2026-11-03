@@ -70,6 +70,8 @@ fn attached_messages_are_written_as_outlook_keeps_them() {
         name: "Ana",
         email: "ana@example.com",
         recipient_type: UnicodePstRecipientType::To,
+        flags: Some(1),
+        track_status: Some(4),
     }];
     let categories = ["Blue"];
     let keywords = [UnicodePstProperty::named(
@@ -164,6 +166,17 @@ fn attached_messages_are_written_as_outlook_keeps_them() {
     let first = level.embedded_message().unwrap();
     assert_eq!(text(first.properties().get(0x0037)), "First");
     assert_eq!(first.recipient_table().unwrap().rows_matrix().count(), 1);
+    // MailCraft: an attached message's recipients keep their flags and track status too.
+    let people = first.recipient_table().unwrap().clone();
+    let row = people
+        .rows_matrix()
+        .map(|row| u32::from(row.id()))
+        .next()
+        .unwrap();
+    assert!(matches!(
+        cell(people.as_ref(), row, 0x5FFF),
+        Some(PropertyValue::Integer32(4))
+    ));
     // Its named property, given an ID from the file's map.
     let blue = first.properties().iter().any(|(id, value)| {
         *id >= 0x8000
