@@ -3851,11 +3851,16 @@ fn find_child_folder(store: &dyn Store, parent: NodeId, name: &str) -> io::Resul
     for row in hierarchy.rows_matrix() {
         let child = NodeId::from(u32::from(row.id()));
         let child_folder = store.open_folder(&store.properties().make_entry_id(child)?)?;
-        if child_folder
-            .properties()
-            .display_name()
-            .is_ok_and(|display_name| display_name.eq_ignore_ascii_case(name))
-        {
+        // MailCraft: an ANSI file's folder name by the bytes it was written in, which the
+        // reader's Latin-1 doesn't give back for what Windows-1252 lacks or keeps above 0x7F.
+        let found = match child_folder.properties().get(0x3001) {
+            Some(PropertyValue::String8(stored)) => same_ansi_folder_name(stored.buffer(), name),
+            _ => child_folder
+                .properties()
+                .display_name()
+                .is_ok_and(|display_name| display_name.eq_ignore_ascii_case(name)),
+        };
+        if found {
             return Ok(Some(child));
         }
     }

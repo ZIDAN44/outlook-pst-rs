@@ -341,6 +341,97 @@ fn an_ansi_file_takes_folders_and_special_folders() {
     std::fs::remove_file(path).unwrap();
 }
 
+/// The top folders of an ANSI file: each one's 8-bit name and how many messages it holds.
+fn top_folders(path: &Path) -> Vec<(Vec<u8>, usize)> {
+    let store = ansi_store(path);
+    let top = store
+        .open_folder(&store.properties().ipm_sub_tree_entry_id().unwrap())
+        .unwrap();
+    let mut out = top
+        .hierarchy_table()
+        .unwrap()
+        .rows_matrix()
+        .map(|row| {
+            let entry = store
+                .properties()
+                .make_entry_id(NodeId::from(u32::from(row.id())))
+                .unwrap();
+            let folder = store.open_folder(&entry).unwrap();
+            let count = folder
+                .contents_table()
+                .map_or(0, |table| table.rows_matrix().count());
+            (bytes8(folder.properties().get(0x3001)), count)
+        })
+        .collect::<Vec<_>>();
+    out.sort();
+    out
+}
+
+/// A folder whose name Windows-1252 can't hold whole, or holds above 0x7F, is found again by
+/// that name (and by the name the reader reads back), so each append goes into the one folder
+/// rather than a new folder of the same written name; names written alike are one folder.
+#[test]
+fn an_ansi_folder_is_found_again_by_its_name() {
+    let path = temp_pst("ansi-folder-names");
+    drop(AnsiPstFile::create_empty(&path).unwrap());
+    let one = |subject| {
+        [UnicodePstBatchMessage {
+            message: message(subject, "<one@example.com>", &[]),
+            attachments: &[],
+        }]
+    };
+    for name in ["Café", "Проекты", "Receipts – 2024", "Wysłane"] {
+        for subject in ["First", "Second"] {
+            drop(
+                AnsiPstFile::append_many_in_folder_with_attachments(&path, &[name], &one(subject))
+                    .unwrap(),
+            );
+        }
+        // And by the name read back (`?` where Windows-1252 has no place, a byte to a character).
+        let back = top_folders(&path)
+            .into_iter()
+            .map(|(name, _)| name)
+            .find(|stored| *stored == windows_1252(name))
+            .unwrap();
+        let back: String = back.iter().map(|&byte| char::from(byte)).collect();
+        drop(
+            AnsiPstFile::append_many_in_folder_with_attachments(&path, &[&back], &one("Third"))
+                .unwrap(),
+        );
+    }
+    // Another name written as `Проекты` is (`???????`): that folder.
+    drop(
+        AnsiPstFile::append_many_in_folder_with_attachments(&path, &["Справка"], &one("Fourth"))
+            .unwrap(),
+    );
+    // A subfolder of one, appended to twice.
+    for subject in ["Fifth", "Sixth"] {
+        drop(
+            AnsiPstFile::append_many_in_folder_with_attachments(
+                &path,
+                &["Проекты", "Отчёты"],
+                &one(subject),
+            )
+            .unwrap(),
+        );
+    }
+    let mut want = vec![
+        (b"Deleted Items".to_vec(), 0),
+        (b"Inbox".to_vec(), 0),
+        (windows_1252("Café"), 3),
+        (b"???????".to_vec(), 4),
+        (b"Receipts \x96 2024".to_vec(), 3),
+        (b"Wys?ane".to_vec(), 3),
+    ];
+    want.sort();
+    assert_eq!(top_folders(&path), want);
+    let store = ansi_store(&path);
+    let (_, reports) = ansi_folder(&store, &["Проекты", "Отчёты"]);
+    assert_eq!(ansi_messages(&store, &reports).len(), 2);
+    check_ansi_file(&path);
+    std::fs::remove_file(path).unwrap();
+}
+
 /// An ANSI file encoded as Outlook encodes its files (permute, or cyclic) is added to: its
 /// blocks read decoded, its new data blocks written encoded alike.
 #[test]

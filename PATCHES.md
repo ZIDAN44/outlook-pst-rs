@@ -312,3 +312,15 @@ are the writer's own.
     whose rows go in place, read back; folders made and recorded as special folders; permute- and
     cyclic-encoded ANSI files added to; each format refused by the other's type; the 2 GB and
     65,536-row limits; the code pages).
+25. **An ANSI file's folder found again by its name** (`lib.rs`, `extra/format.rs`): an ANSI
+    file's folder names are written in Windows-1252, a `?` for a character it hasn't, and the
+    writer found a folder by comparing the name asked for with the name the reader reads back,
+    a byte to a character (Latin-1). A name with a character Windows-1252 lacks (Cyrillic,
+    Greek, Polish `ł`) or keeps above 0x7F where Latin-1 has a control (an en dash, curly
+    quotes, the euro sign) never matched, so each append to it made another folder of the same
+    written name. `find_child_folder` compares an 8-bit name's bytes with the name as the writer
+    writes it, or as the reader reads it back (`same_ansi_folder_name`), ASCII letters in either
+    case; names written alike (`Письма` and `Отчёты` are both `??????`) are one folder, which a
+    caller that needs them apart names apart.
+
+    Test: `extra::ansi::tests::an_ansi_folder_is_found_again_by_its_name`.

@@ -227,6 +227,24 @@ impl CodePage {
     }
 }
 
+/// Whether `stored`, a folder's 8-bit name in an ANSI file, is `name`: `name` as the writer wrote
+/// it (in Windows-1252, a `?` for a character it hasn't), or as the reader reads the bytes back
+/// (a byte to a character of its own, U+0080 to U+009F among them), ASCII letters in either case.
+/// So the same name finds the same folder each time it is asked for, whatever Windows-1252 lacks;
+/// names that are written alike (`Письма` and `Отчёты` both `??????`) are one folder.
+pub(crate) fn same_ansi_folder_name(stored: &[u8], name: &str) -> bool {
+    let stored = stored.strip_suffix(&[0]).unwrap_or(stored);
+    let mut wanted = name.chars().map(|c| {
+        windows_1252(c)
+            .or_else(|| u8::try_from(u32::from(c)).ok())
+            .unwrap_or(b'?')
+    });
+    stored
+        .iter()
+        .all(|&byte| wanted.next().is_some_and(|c| c.eq_ignore_ascii_case(&byte)))
+        && wanted.next().is_none()
+}
+
 /// The Windows-1252 byte for `c`, if it has one (its five undefined bytes stand for the C1
 /// controls they number, as readers read them).
 fn windows_1252(c: char) -> Option<u8> {
